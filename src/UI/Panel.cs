@@ -58,7 +58,8 @@ public class Panel : MonoBehaviour
 		public static readonly Color History = W(0.16f);
 		public static readonly Color Track = W(0.10f);
 		public static readonly Color Selection = A(Accent, 0.35f);
-		public const float ShadowAlpha = 0.42f, FeedShadowAlpha = 0.24f; // feed: a stack of small capsules, so a lighter drop each
+		public const float ShadowAlpha = 0.42f;
+		public static readonly Color ChatTextShade = new(0f, 0f, 0f, 0.7f); // chat has no backing; this shadow is its only ground
 		public const float Clear = 0f;
 	}
 
@@ -80,7 +81,7 @@ public class Panel : MonoBehaviour
 		public const int Tex = 64, TexSmall = 32, ShadowTex = 96;
 		// Chat (Chat.cs): bottom-left column above the vitals; ChatBottom is a fraction of the screen height.
 		public const float ChatW = 300, ChatBottom = 0.79f, ChatLineH = 26, ChatLinePadX = 12, ChatLineGap = 6, ChatNameGap = 8;
-		public const float ChatHistMax = 196, ChatWellPad = 10, ChatFootH = 16, ChatFootGap = 6, ChatShadow = 14, ChatDrop = 3;
+		public const float ChatHistMax = 196, ChatTextShadow = 1.5f;
 		public const int ChatFeed = 5, ChatHistory = 60;
 	}
 

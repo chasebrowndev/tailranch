@@ -44,7 +44,7 @@ public class Chat : MonoBehaviour
 	vp_FPInput fp;
 	int demoStep;
 	float demoNext;
-	GUIStyle ground, feedBg, feedShadow, well, composer, title, chipTop, nick, text, placeholder, foot, footRight;
+	GUIStyle composer, nick, text, nickShade, textShade, placeholder, footRight;
 
 	// ---------- network ----------
 
@@ -299,8 +299,12 @@ public class Chat : MonoBehaviour
 	// nw: the name column (one shared width in the history well, so the messages start on one edge).
 	float LineH(Line l, float w, float nw) => Mathf.Max(text.lineHeight, text.CalcHeight(new GUIContent(l.Text), w - nw - S.ChatNameGap));
 
+	// No backing: a soft drop shadow under the glyphs carries the line over the scene.
 	void DrawLine(Line l, Rect r, float nw)
 	{
+		var o = S.ChatTextShadow;
+		GUI.Label(new Rect(r.x + o, r.y + o, nw, text.lineHeight), l.Name, nickShade);
+		GUI.Label(new Rect(r.x + nw + S.ChatNameGap + o, r.y + o, r.width - nw - S.ChatNameGap, r.height), l.Text, textShade);
 		GUI.Label(new Rect(r.x, r.y, nw, text.lineHeight), l.Name, nick);
 		GUI.Label(new Rect(r.x + nw + S.ChatNameGap, r.y, r.width - nw - S.ChatNameGap, r.height), l.Text, text);
 	}
@@ -328,8 +332,6 @@ public class Chat : MonoBehaviour
 			if (DockVis > 0 && y < DockBottom + S.ChatLineGap) break; // a menu is up: only what fits under the panel
 			var r = new Rect(x, y, tw + 2 * S.ChatLinePadX, h);
 			GUI.color = W(a);
-			feedShadow.Draw(new Rect(r.x - S.ChatShadow, r.y - S.ChatShadow + S.ChatDrop, r.width + 2 * S.ChatShadow, r.height + 2 * S.ChatShadow), false, false, false, false);
-			feedBg.Draw(r, false, false, false, false);
 			DrawLine(l, new Rect(r.x + S.ChatLinePadX, r.y + padY, tw, th), NameW(l));
 			y -= S.ChatLineGap;
 		}
@@ -339,9 +341,8 @@ public class Chat : MonoBehaviour
 	void DrawOpen(float x, float bottom, float vis)
 	{
 		var e = Ease(vis);
-		var w = S.ChatW;
-		var inner = w - 2 * S.PadX;
-		var rowW = inner - 2 * S.ChatWellPad;
+		var inner = S.ChatW;
+		var rowW = inner - 2 * S.ChatLinePadX;
 
 		// History: as many of the newest lines as fit, oldest on top.
 		var heights = new List<float>();
@@ -352,46 +353,28 @@ public class Chat : MonoBehaviour
 		{
 			var h = LineH(lines[i], rowW, nameCol);
 			var add = h + (heights.Count > 0 ? S.ChatLineGap : 0);
-			if (histH + add > S.ChatHistMax - 2 * S.ChatWellPad) break;
+			if (histH + add > S.ChatHistMax) break;
 			heights.Add(h);
 			histH += add;
 		}
-		var wellH = (heights.Count > 0 ? histH : text.lineHeight) + 2 * S.ChatWellPad;
-		var headH = Z.Title + 4;
-		var total = S.PadTop + headH + S.Block + wellH + S.Block + S.PillH + S.ChatFootGap + S.ChatFootH + S.PadBottom;
+		// Bare lines over the scene, then the composer: no panel, header or footer.
+		var total = histH + (heights.Count > 0 ? S.Block : 0) + S.PillH;
 		var y = bottom - total + S.Slide * (1 - e) * 0.5f;
-		var box = new Rect(x, y, w, total);
 
 		GUI.color = W(e);
+		var cx = x;
+		var cy = y;
 		if (Event.current.type == EventType.Repaint)
 		{
-			feedShadow.Draw(new Rect(box.x - S.Shadow, box.y - S.Shadow + S.ShadowDrop, box.width + 2 * S.Shadow, box.height + 2 * S.Shadow), false, false, false, false);
-			ground.Draw(box, false, false, false, false);
-		}
-		var cx = x + S.PadX;
-		var cy = y + S.PadTop;
-
-		// Header: title left, who can hear you right.
-		GUI.Label(new Rect(cx, cy, inner, headH), "Chat", title);
-		var n = Session.Players.Count + 1;
-		GUI.Label(new Rect(cx, cy, inner, headH), $"{n} {(n == 1 ? "PLAYER" : "PLAYERS")}", chipTop);
-		cy += headH + S.Block;
-
-		// History well.
-		var wr = new Rect(cx, cy, inner, wellH);
-		if (Event.current.type == EventType.Repaint)
-		{
-			well.Draw(wr, false, false, false, false);
-			if (heights.Count == 0) GUI.Label(new Rect(wr.x + S.ChatWellPad, wr.y + S.ChatWellPad, rowW, text.lineHeight), "No messages yet", placeholder);
-			var ly = wr.y + S.ChatWellPad;
+			var ly = cy;
 			for (var k = heights.Count - 1; k >= 0; k--)
 			{
 				var l = lines[lines.Count - 1 - k];
-				DrawLine(l, new Rect(wr.x + S.ChatWellPad, ly, rowW, heights[k]), nameCol);
+				DrawLine(l, new Rect(cx + S.ChatLinePadX, ly, rowW, heights[k]), nameCol);
 				ly += heights[k] + S.ChatLineGap;
 			}
 		}
-		cy += wellH + S.Block;
+		if (heights.Count > 0) cy += histH + S.Block;
 
 		// Composer: the hero and the one gold.
 		var cr = new Rect(cx, cy, inner, S.PillH);
@@ -405,25 +388,22 @@ public class Chat : MonoBehaviour
 			((TextEditor)GUIUtility.GetStateObject(typeof(TextEditor), GUIUtility.keyboardControl)).MoveTextEnd();
 			focus = false;
 		}
-		cy += S.PillH + S.ChatFootGap;
 
-		// Footer: keys, then the counter (or the limiter's reason) at the right.
+		// Only speak up inside the composer when it matters: the limiter tripped, or the draft is nearly full.
 		var denied = Time.unscaledTime - deniedAt < M.ChatDenied;
-		GUI.Label(new Rect(cx + S.ChatLinePadX * 0.5f, cy, inner, S.ChatFootH), "ENTER  send     ESC  close", foot);
-		footRight.normal.textColor = denied ? C.Danger : draft.Length > MaxLen * 0.9f ? C.Warn : C.Text3;
-		GUI.Label(new Rect(cx, cy, inner - S.ChatLinePadX * 0.5f, S.ChatFootH), denied ? "slow down" : $"{draft.Length} / {MaxLen}", footRight);
+		if (denied || draft.Length > MaxLen * 0.9f)
+		{
+			footRight.normal.textColor = denied ? C.Danger : C.Warn;
+			GUI.Label(new Rect(cr.x, cr.y, cr.width - S.ChatLinePadX, cr.height), denied ? "slow down" : $"{MaxLen - draft.Length}", footRight);
+		}
 		GUI.color = Color.white;
 	}
 
 	void Style()
 	{
-		if (ground != null && ground.normal.background) return;
+		if (composer != null && composer.normal.background) return;
 		RectOffset Pad(int v) => new(v, v, v, v);
 		var none = new Color(0, 0, 0, C.Clear);
-		ground = new GUIStyle { normal = { background = Rounded(S.Tex, R.Panel, C.Ground, C.Rim, C.GroundTop, 30) }, border = Pad((int)R.Panel) };
-		feedBg = new GUIStyle { normal = { background = Rounded(S.TexSmall, R.Inline, C.CardGround, C.Rim, C.GroundTop, 10) }, border = Pad((int)R.Inline) };
-		feedShadow = new GUIStyle { normal = { background = Soft(S.Tex, 20, 20, C.FeedShadowAlpha) }, border = Pad(31) };
-		well = new GUIStyle { normal = { background = Rounded(S.TexSmall, R.Well, C.Well, C.WellRim, C.WellTop, 8) }, border = Pad((int)R.Well) };
 		var gold = Rounded(S.TexSmall, R.Pill, C.Well, C.AccentBorderHover, none, 0);
 		composer = new GUIStyle
 		{
@@ -433,12 +413,11 @@ public class Chat : MonoBehaviour
 			border = Pad((int)R.Pill), padding = new RectOffset(14, 14, 0, 0), alignment = TextAnchor.MiddleLeft,
 			fontSize = Z.Body, clipping = TextClipping.Clip, richText = false,
 		};
-		title = new GUIStyle { normal = { textColor = C.Text }, fontSize = Z.Title, fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleLeft };
-		chipTop = new GUIStyle { normal = { textColor = C.Text3 }, fontSize = Z.Micro, fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleRight };
 		nick = new GUIStyle { normal = { textColor = C.Text2 }, fontSize = Z.Body, fontStyle = FontStyle.Bold, richText = false };
 		text = new GUIStyle { normal = { textColor = C.Text }, fontSize = Z.Body, wordWrap = true, richText = false };
+		nickShade = new GUIStyle(nick) { normal = { textColor = C.ChatTextShade } };
+		textShade = new GUIStyle(text) { normal = { textColor = C.ChatTextShade } };
 		placeholder = new GUIStyle { normal = { textColor = C.Text3 }, fontSize = Z.Body, alignment = TextAnchor.MiddleLeft, padding = new RectOffset(14, 14, 0, 0) };
-		foot = new GUIStyle { normal = { textColor = C.Text3 }, fontSize = Z.Micro, fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleLeft };
-		footRight = new GUIStyle(foot) { alignment = TextAnchor.MiddleRight };
+		footRight = new GUIStyle { normal = { textColor = C.Text3 }, fontSize = Z.Micro, fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleRight };
 	}
 }
