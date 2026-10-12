@@ -71,6 +71,13 @@ public class ActorPuppet : MonoBehaviour
 		if (snaps.Count > 32) snaps.RemoveAt(0);
 	}
 
+	// Body stopped being kinematic by design (produce off its joint): don't restore kinematic on hand-back.
+	public void Unpin()
+	{
+		wasKinematic = false;
+		if (!driven && rb) rb.isKinematic = false;
+	}
+
 	void Enforce()
 	{
 		if (aiOff)
