@@ -120,7 +120,7 @@ public class Panel : MonoBehaviour
 	readonly Dictionary<byte, string> known = new();
 	readonly int[] hist = new int[(int)S.Bars];
 	int histHead, histCount;
-	bool wasActive, wasRemote, hinted;
+	bool wasActive, wasRemote, hinted, warned;
 	string lastStatus = "offline";
 	float quietUntil, vis, height = 160, shownH = 160, nextFind, nextSample, upSince;
 	MainMenuUI mainMenu;
@@ -156,6 +156,14 @@ public class Panel : MonoBehaviour
 
 	void Update()
 	{
+		// Polled, not on activeSceneChanged: the menu may already be up when the plugin loads.
+		if (!warned && SceneManager.GetActiveScene().name == "MainMenu")
+		{
+			warned = true;
+			var why = Plugin.Unsupported;
+			Plugin.Log.LogInfo($"game build {Plugin.GameBuild}{(why != null ? $": {why}" : "")}");
+			if (why != null) Push("unsupported", why, Tone.Alarm);
+		}
 		Track();
 		Sample();
 		var dt = Time.unscaledDeltaTime;

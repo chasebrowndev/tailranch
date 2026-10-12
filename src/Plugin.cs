@@ -15,7 +15,14 @@ namespace TailRanch;
 public class Plugin : BaseUnityPlugin
 {
 	public const string Guid = "dev.chasebrown.tailranch";
-	public const string Version = "0.3.0";
+	public const string Version = "0.3.1";
+	static int failedHooks;
+	// The menu's version label (Application.version says 1.4.3 on 1.4.4). Needs GameContext, so only valid from the menu on.
+	public static string GameBuild => SRSingleton<GameContext>.Instance ? SRSingleton<GameContext>.Instance.MessageDirector.Get("build", "m.version") : "?";
+	public static string Unsupported =>
+		GameBuild != GameVersion ? $"Slime Rancher {GameBuild} is unsupported (needs {GameVersion})"
+		: failedHooks > 0 ? $"{failedHooks} game hooks failed; sync may break" : null;
+	public const string GameVersion = "1.4.4"; // the only game build TailRanch is written and tested against
 
 	public static Plugin I;
 	public static ManualLogSource Log;
@@ -63,6 +70,7 @@ public class Plugin : BaseUnityPlugin
 			catch (System.Exception e) { failed++; Log.LogError($"patch {t.FullName} failed: {e.InnerException?.Message ?? e.Message}"); }
 		}
 		Log.LogInfo($"patched {ok} classes, {failed} failed");
+		failedHooks = failed;
 		gameObject.AddComponent<Panel>();
 		gameObject.AddComponent<Chat>();
 		SceneManager.sceneLoaded += (scene, _) =>

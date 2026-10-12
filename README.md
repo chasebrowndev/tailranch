@@ -14,7 +14,7 @@ The host is authoritative: it simulates the world (slimes, spawners, ranch autom
 
 1. Install [BepInEx 5](https://github.com/BepInEx/BepInEx/releases) (x64) into the Slime Rancher folder and launch the game once.
 2. Download `TailRanch.dll` from [Releases](https://github.com/chasebrowndev/tailranch/releases) into `BepInEx/plugins/TailRanch/`.
-3. Every player needs Tailscale running and to be on the same tailnet, all on the same TailRanch version.
+3. Every player needs Tailscale running and to be on the same tailnet, all on the same TailRanch version and Slime Rancher 1.4.4 (the final SR1 release). Other game versions are refused at join, and the main menu warns if your build is unsupported.
 
 ## Play
 

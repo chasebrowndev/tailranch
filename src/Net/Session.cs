@@ -228,6 +228,7 @@ public static class Session
 				var w = Packets.Begin(Op.Hello);
 				w.Put(Plugin.Version);
 				w.Put(Plugin.Name);
+				w.Put(Plugin.GameBuild);
 				Send(peer, w, DeliveryMethod.ReliableOrdered);
 			}
 		};
@@ -281,6 +282,14 @@ public static class Session
 		{
 			var w = new NetDataWriter();
 			w.Put($"version mismatch: host {Plugin.Version}, you {ver}");
+			p.Peer.Disconnect(w);
+			return;
+		}
+		var game = r.GetString();
+		if (game != Plugin.GameBuild)
+		{
+			var w = new NetDataWriter();
+			w.Put($"game version mismatch: host {Plugin.GameBuild}, you {game}");
 			p.Peer.Disconnect(w);
 			return;
 		}
