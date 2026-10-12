@@ -46,6 +46,7 @@ public enum Op : byte
 	StorageState,   // RanchSync (decorizer, glitch storage)
 	Profile,        // ProfileSync (kind byte + payload: upgrades, blueprints, gadget counts, pedia, mail)
 	Chat,           // c→h  text string; h→* senderId byte, senderName string, text string (host-stamped, sender included)
+	Craft,          // RanchSync (refinery fabricate: c→h gadgetId int, host spends; h→c gadgetId int, refused)
 }
 
 public static class Packets

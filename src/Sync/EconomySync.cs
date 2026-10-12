@@ -127,9 +127,12 @@ public static class EconomySync
 			switch (kind)
 			{
 				case ExchangeKind.Accept:
+				{
 					// Not under Apply: crate spawns and progress awards must broadcast from here.
-					ed.TryAccept(type, (Identifiable.Id)r.GetInt(), AwardersFor(type));
+					var id = (Identifiable.Id)r.GetInt();
+					if (!ed.TryAccept(type, id, AwardersFor(type))) RanchSync.SendShortfall(from, id, 1); // refused: the client gets its item back
 					break;
+				}
 				case ExchangeKind.Put:
 					var offer = ReadOffer(r);
 					var w = World;

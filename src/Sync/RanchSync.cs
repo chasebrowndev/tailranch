@@ -162,14 +162,25 @@ public static class RanchSync
 			var ops = new (int slot, Identifiable.Id id, int delta)[n];
 			for (var i = 0; i < n; i++) ops[i] = (r.GetByte(), (Identifiable.Id)r.GetInt(), r.GetInt());
 			var s = FindSilo(id, type);
-			if (s == null || Slots(s.LocalAmmo) == null) return;
+			var gone = s == null || Slots(s.LocalAmmo) == null;
 			var miss = new List<(Identifiable.Id id, int n)>();
 			foreach (var op in ops)
 			{
-				var gap = op.delta - ApplyOp(s.LocalAmmo, op.slot, op.id, op.delta);
+				var gap = gone ? op.delta : op.delta - ApplyOp(s.LocalAmmo, op.slot, op.id, op.delta);
 				if (gap != 0) miss.Add((op.id, gap));
 			}
-			var w = SiloPacket(s, true);
+			NetDataWriter w;
+			if (gone)
+			{
+				// No such silo here: ack at once with empty contents and every op as shortfall, so the
+				// client refunds now instead of waiting out AckTimeout.
+				w = Packets.Begin(Op.SiloState);
+				w.Put(id);
+				w.Put(type);
+				w.Put((byte)0);
+				w.Put(true);
+			}
+			else w = SiloPacket(s, true);
 			w.Put((byte)miss.Count);
 			foreach (var m in miss)
 			{
@@ -177,7 +188,7 @@ public static class RanchSync
 				w.Put(m.n);
 			}
 			Session.SendTo(from, w, R);
-			MarkSilo(s);
+			if (!gone) MarkSilo(s);
 		});
 
 		On(Op.FeederSpeed, r =>
@@ -353,6 +364,28 @@ public static class RanchSync
 			}
 			else counts[id] = v;
 		});
+
+		// c→h  gadgetId int: the client fabricated it locally. The host spends the costs from the shared
+		//      refinery (its own definition, never the client's numbers).
+		// h→c  gadgetId int: the refinery couldn't cover it; the client takes the crafted gadget(s) back.
+		Session.On(Op.Craft, (from, r) =>
+		{
+			var id = (Gadget.Id)r.GetInt();
+			if (!Session.InWorld) return;
+			var ctx = SRSingleton<SceneContext>.Instance;
+			GadgetDefinition def;
+			try { def = SRSingleton<GameContext>.Instance.LookupDirector.GetGadgetDefinition(id); }
+			catch (KeyNotFoundException) { return; }
+			if (Session.IsHost)
+			{
+				if (ctx.GadgetDirector.TryToSpendFromRefinery(def.craftCosts)) return; // the spend postfix broadcasts the totals
+				Session.SendTo(from, Packets.Begin(Op.Craft).Also(w => w.Put((int)id)), R);
+				foreach (var c in def.craftCosts) SendRefinery(c.id, 0); // resync the requester's mirror
+				return;
+			}
+			// Not under Apply: the gadget-count deltas must reach the host to cancel the craft's.
+			for (var i = def.buyInPairs ? 2 : 1; i > 0; i--) ctx.GadgetDirector.RemoveGadget(id);
+		});
 	}
 
 	// Symmetric world event: host relays to the other clients, everyone replays under Apply.
@@ -435,8 +468,9 @@ public static class RanchSync
 		else Session.SendToHost(w, R);
 	}
 
-	// Host: a client's decorizer/glitch delta only partly applied (full, wrong item, already emptied).
-	static void SendShortfall(Player to, Identifiable.Id id, int gap)
+	// Host: a client's decorizer/glitch delta only partly applied (full, wrong item, already emptied),
+	// or an exchange deposit the host refused.
+	public static void SendShortfall(Player to, Identifiable.Id id, int gap)
 	{
 		if (gap == 0 || to == null) return;
 		var w = Packets.Begin(Op.StorageState);
@@ -1038,12 +1072,32 @@ public static class RanchSync
 		}
 	}
 
+	// Client: which gadget the fabricator is crafting, so the spend goes to the host as one craft it can refuse.
+	static Gadget.Id crafting = Gadget.Id.NONE;
+
+	[HarmonyPatch(typeof(FabricateGadgetUI), nameof(FabricateGadgetUI.Fabricate))]
+	static class FabricateScope
+	{
+		static void Prefix(Gadget.Id id) => crafting = id;
+
+		static Exception Finalizer(Exception __exception)
+		{
+			crafting = Gadget.Id.NONE;
+			return __exception;
+		}
+	}
+
 	[HarmonyPatch(typeof(GadgetDirector), nameof(GadgetDirector.TryToSpendFromRefinery))]
 	static class RefinerySpend
 	{
 		static void Postfix(GadgetDefinition.CraftCost[] costs, bool __result)
 		{
 			if (!Live || !__result) return;
+			if (Session.IsClient && crafting != Gadget.Id.NONE)
+			{
+				Session.SendToHost(Packets.Begin(Op.Craft).Also(w => w.Put((int)crafting)), R);
+				return;
+			}
 			foreach (var c in costs)
 				if (c.amount > 0) SendRefinery(c.id, -c.amount);
 		}
