@@ -44,6 +44,7 @@ public enum Op : byte
 	MarketState,    // EconomySync
 	ExchangeState,  // EconomySync
 	StorageState,   // RanchSync (decorizer, glitch storage)
+	Profile,        // ProfileSync (kind byte + payload: upgrades, blueprints, gadget counts, pedia, mail)
 }
 
 public static class Packets
