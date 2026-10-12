@@ -40,7 +40,16 @@ public class Plugin : BaseUnityPlugin
 		if (System.Environment.GetEnvironmentVariable("TAILRANCH_NAME") is { Length: > 0 } name) PlayerName.Value = name;
 		if (System.Environment.GetEnvironmentVariable("TAILRANCH_LOOPBACK") == "1") AllowLoopback.Value = true;
 
-		new Harmony(Guid).PatchAll();
+		// Per class so one stale target logs instead of killing every other patch.
+		var harmony = new Harmony(Guid);
+		int ok = 0, failed = 0;
+		foreach (var t in AccessTools.GetTypesFromAssembly(typeof(Plugin).Assembly))
+		{
+			if (!t.IsDefined(typeof(HarmonyPatch), false)) continue;
+			try { harmony.CreateClassProcessor(t).Patch(); ok++; }
+			catch (System.Exception e) { failed++; Log.LogError($"patch {t.FullName} failed: {e.InnerException?.Message ?? e.Message}"); }
+		}
+		Log.LogInfo($"patched {ok} classes, {failed} failed");
 		gameObject.AddComponent<Panel>();
 		SceneManager.sceneLoaded += (scene, _) =>
 		{
