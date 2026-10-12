@@ -22,6 +22,8 @@ public static class ActorSync
 	const int PerPacket = 22; // 3 + 22 * 48 bytes
 	const long Block = 1L << 48;
 	const DeliveryMethod RO = DeliveryMethod.ReliableOrdered;
+	const byte Unknown = 0xFF; // ActorDeny owner: host has no such actor
+	const byte Upsert = 0x80;  // state flag: only update an existing actor, never create
 
 	static readonly Dictionary<long, GameObject> objs = new();
 	static readonly Dictionary<GameObject, long> idOf = new();
@@ -29,6 +31,8 @@ public static class ActorSync
 	static readonly Dictionary<long, byte> owner = new();
 	static readonly HashSet<long> pendingSpawns = new();
 	static readonly HashSet<long> pendingDespawns = new();
+	static readonly HashSet<long> pendingState = new();
+	static readonly List<(long id, Vector3 pos, Quaternion rot, Vector3 vel)> relay = new();
 	static readonly Dictionary<long, (Vector3 pos, Quaternion rot)> lastSent = new();
 	static readonly Dictionary<long, float> restSince = new();
 	static readonly List<GameObject> loadStrays = new();
@@ -46,6 +50,11 @@ public static class ActorSync
 	static readonly RegFn register = AccessTools.MethodDelegate<RegFn>(AccessTools.Method(typeof(GameModel), "RegisterActor"));
 	static readonly AccessTools.FieldRef<GameModel, long> nextActorId = AccessTools.FieldRefAccess<GameModel, long>("nextActorId");
 	static readonly AccessTools.FieldRef<GameModel, Dictionary<long, ActorModel>> actors = AccessTools.FieldRefAccess<GameModel, Dictionary<long, ActorModel>>("actors");
+	delegate void InitStateFn(ResourceCycle rc, ResourceCycle.State state, double progressTime);
+	static readonly InitStateFn setInitState = AccessTools.MethodDelegate<InitStateFn>(AccessTools.Method(typeof(ResourceCycle), "SetInitState"));
+	static readonly AccessTools.FieldRef<ResourceCycle, ProduceModel> produce = AccessTools.FieldRefAccess<ResourceCycle, ProduceModel>("model");
+	static readonly AccessTools.FieldRef<SlimeFeral, SlimeModel> feralModel = AccessTools.FieldRefAccess<SlimeFeral, SlimeModel>("model");
+	static readonly FieldInfo slotted = AccessTools.Field(typeof(AttachFashions), "slotted");
 
 	// True when another machine simulates this actor (local copy is a puppet).
 	// Consumers (eat, market, silo, incinerator, collectors) must ignore such actors.
@@ -59,6 +68,9 @@ public static class ActorSync
 		SceneManager.sceneLoaded += (_, _) => Purge();
 		Session.PlayerReady += OnReady;
 
+		// ActorSpawn: actorId long, ident int, regionSet int, pos, rot, vel, then a state block (WriteState).
+		// Known id = upsert: only the state block applies (motion carries the transform). Host takes full state
+		// from the owner, looks (fashions/appearance) from anyone, and re-sends its own view to the rest.
 		Session.On(Op.ActorSpawn, (from, r) =>
 		{
 			var id = r.GetLong();
@@ -67,8 +79,21 @@ public static class ActorSync
 			var pos = r.GetVector3();
 			var rot = r.GetQuaternion();
 			var vel = r.GetVector3();
-			if (!Accept(from, r, id)) return;
-			if (objs.TryGetValue(id, out var have) && have) return;
+			var st = ReadState(r);
+			if (Session.IsClient && !Enter()) return;
+			if (objs.TryGetValue(id, out var have) && have)
+			{
+				var full = Session.IsClient || owner.TryGetValue(id, out var o) && o == from.Id;
+				using (Session.Apply()) ApplyState(have, st, full);
+				if (Session.IsHost) Session.Broadcast(SpawnPacket(id, have, true), RO, from);
+				return;
+			}
+			if ((st.flags & Upsert) != 0) return;
+			if (Session.IsHost)
+			{
+				if (id / Block != from.Id) return;
+				Session.Relay(from, r, RO);
+			}
 			var prefab = SRSingleton<GameContext>.Instance.LookupDirector.GetPrefab(ident);
 			if (!prefab) return;
 			GameObject go;
@@ -77,22 +102,45 @@ public static class ActorSync
 			var rb = go.GetComponent<Rigidbody>();
 			if (rb && !rb.isKinematic) rb.velocity = vel;
 			if (Session.IsHost) owner[id] = from.Id;
+			using (Session.Apply()) ApplyState(go, st, true);
 			Puppetize(id, go);
 		});
 
+		// ActorDespawn: actorId long. Host: the sender must own it, or it's host-owned and not in the host's vac.
+		// Refused: the sender gets it back (ActorSpawn, plus ActorClaim when another client owns it).
 		Session.On(Op.ActorDespawn, (from, r) =>
 		{
 			var id = r.GetLong();
-			if (!Accept(from, r, -1)) return;
+			if (Session.IsClient)
+			{
+				if (!Enter() || !objs.TryGetValue(id, out var g)) return;
+				if (g) using (Session.Apply()) Destroyer.DestroyActor(g, "TailRanch.Despawn");
+				else Forget(id, null);
+				return;
+			}
 			if (!objs.TryGetValue(id, out var go)) return;
-			if (go) using (Session.Apply()) Destroyer.DestroyActor(go, "TailRanch.Despawn");
-			else Forget(id, null);
+			if (!go)
+			{
+				Forget(id, null);
+				Session.Relay(from, r, RO);
+				return;
+			}
+			var cur = owner.TryGetValue(id, out var c) ? c : Session.HostId;
+			if (cur == Session.HostId ? Captive(go) : cur != from.Id)
+			{
+				Session.SendTo(from, SpawnPacket(id, go, false), RO);
+				if (cur != Session.HostId) Session.SendTo(from, Claim(id, cur), RO);
+				return;
+			}
+			Session.Relay(from, r, RO);
+			using (Session.Apply()) Destroyer.DestroyActor(go, "TailRanch.Despawn");
 		});
 
+		// ActorMotion: count ushort, then per actor id long, pos, rot, vel. Host forwards only entries the sender owns.
 		Session.On(Op.ActorMotion, (from, r) =>
 		{
-			if (Session.IsHost) Session.Relay(from, r, DeliveryMethod.Sequenced);
-			else if (!Enter()) return;
+			if (Session.IsClient && !Enter()) return;
+			relay.Clear();
 			int n = r.GetUShort();
 			for (var i = 0; i < n; i++)
 			{
@@ -101,12 +149,26 @@ public static class ActorSync
 				var rot = r.GetQuaternion();
 				var vel = r.GetVector3();
 				if (Session.IsHost ? !(owner.TryGetValue(id, out var o) && o == from.Id) : Owns(id)) continue;
+				if (Session.IsHost) relay.Add((id, pos, rot, vel));
 				if (!objs.TryGetValue(id, out var go) || !go) continue;
-				var p = go.GetComponent<ActorPuppet>() ?? ActorPuppet.Set(go, true, true);
+				var p = go.GetComponent<ActorPuppet>();
+				if (!p) p = ActorPuppet.Set(go, true, true);
 				if (p) p.Push(pos, rot, vel);
 			}
+			if (relay.Count == 0) return;
+			var w = Packets.Begin(Op.ActorMotion);
+			w.Put((ushort)relay.Count);
+			foreach (var m in relay)
+			{
+				w.Put(m.id);
+				w.Put(m.pos);
+				w.Put(m.rot);
+				w.Put(m.vel);
+			}
+			Session.Broadcast(w, DeliveryMethod.Sequenced, from);
 		});
 
+		// ActorClaim: actorId long, owner byte. c→h request; h→c announcement. Refusals answer with ActorDeny.
 		Session.On(Op.ActorClaim, (from, r) =>
 		{
 			var id = r.GetLong();
@@ -115,14 +177,13 @@ public static class ActorSync
 			{
 				if (!objs.TryGetValue(id, out var go) || !go)
 				{
-					Session.SendTo(from, Claim(id, Session.HostId), RO);
+					Session.SendTo(from, Deny(id, Unknown), RO);
 					return;
 				}
 				var cur = owner.TryGetValue(id, out var c) ? c : Session.HostId;
-				var vac = go.GetComponent<Vacuumable>();
-				if (cur != Session.HostId ? cur != from.Id : vac && (vac.isCaptive() || vac.isHeld()))
+				if (cur != Session.HostId ? cur != from.Id : Captive(go))
 				{
-					Session.SendTo(from, Claim(id, cur), RO);
+					Session.SendTo(from, Deny(id, cur), RO);
 					return;
 				}
 				owner[id] = from.Id;
@@ -132,12 +193,37 @@ public static class ActorSync
 				return;
 			}
 			if (!Enter()) return;
+			var mine = Owns(id);
 			if (o == Session.HostId) owner.Remove(id);
 			else owner[id] = o;
 			restSince.Remove(id);
-			if (objs.TryGetValue(id, out var g) && g) ActorPuppet.Set(g, o != Session.LocalId, true);
+			if (!objs.TryGetValue(id, out var g) || !g) return;
+			if (o == Session.LocalId) ActorPuppet.Set(g, false, true);
+			else if (mine) Revoke(g);
+			else ActorPuppet.Set(g, true, true);
 		});
 
+		// ActorDeny h→c (requester only): actorId long, owner byte = who simulates it now
+		// (Unknown 0xFF: host has no such actor, drop the local copy). Client stops simulating and follows the owner.
+		Session.On(Op.ActorDeny, (from, r) =>
+		{
+			var id = r.GetLong();
+			var o = r.GetByte();
+			if (Session.IsHost || !Enter() || o == Session.LocalId) return;
+			restSince.Remove(id);
+			lastSent.Remove(id);
+			if (o == Unknown)
+			{
+				owner.Remove(id);
+				if (objs.TryGetValue(id, out var dead) && dead) using (Session.Apply()) Destroyer.DestroyActor(dead, "TailRanch.Deny");
+				return;
+			}
+			if (o == Session.HostId) owner.Remove(id);
+			else owner[id] = o;
+			if (objs.TryGetValue(id, out var go) && go) Revoke(go);
+		});
+
+		// ActorRelease: actorId long. c→h hand back; h→c the host simulates it again.
 		Session.On(Op.ActorRelease, (from, r) =>
 		{
 			var id = r.GetLong();
@@ -151,19 +237,35 @@ public static class ActorSync
 				return;
 			}
 			if (!Enter()) return;
+			var mine = Owns(id);
 			owner.Remove(id);
 			restSince.Remove(id);
-			if (objs.TryGetValue(id, out var g) && g) ActorPuppet.Set(g, true, true);
+			if (!objs.TryGetValue(id, out var g) || !g) return;
+			if (mine) Revoke(g);
+			else ActorPuppet.Set(g, true, true);
 		});
 	}
 
-	// Host: validate + relay client spawn/despawn. Client: drop until the remote world is up.
-	static bool Accept(Player from, NetPacketReader r, long id)
+	static bool Captive(GameObject go)
 	{
-		if (Session.IsClient) return Enter();
-		if (id >= 0 && id / Block != from.Id) return false;
-		Session.Relay(from, r, RO);
-		return true;
+		var vac = go.GetComponent<Vacuumable>();
+		return vac && (vac.isCaptive() || vac.isHeld());
+	}
+
+	// Client: lost an actor it was simulating. Let go of it in the vac and follow the owner again.
+	static void Revoke(GameObject go)
+	{
+		var vac = go.GetComponent<Vacuumable>();
+		if (vac && vac.isHeld())
+		{
+			var player = SRSingleton<SceneContext>.Instance.Player;
+			var gun = player ? player.GetComponentInChildren<WeaponVacuum>() : null;
+			if (gun) gun.DropAllVacced();
+			else vac.release();
+		}
+		else if (vac && (vac.isCaptive() || vac.Pending)) vac.release();
+		if (vac) vac.PreventCaptureFor(1f);
+		ActorPuppet.Set(go, true, true);
 	}
 
 	static void Puppetize(long id, GameObject go)
@@ -174,6 +276,154 @@ public static class ActorSync
 
 	static NetDataWriter Claim(long id, byte o) => Packets.Begin(Op.ActorClaim).Also(w => { w.Put(id); w.Put(o); });
 	static NetDataWriter Release(long id) => Packets.Begin(Op.ActorRelease).Also(w => w.Put(id));
+	static NetDataWriter Deny(long id, byte o) => Packets.Begin(Op.ActorDeny).Also(w => { w.Put(id); w.Put(o); });
+
+	static NetDataWriter SpawnPacket(long id, GameObject go, bool upsert)
+	{
+		var t = go.transform;
+		var rb = go.GetComponent<Rigidbody>();
+		var w = Packets.Begin(Op.ActorSpawn);
+		w.Put(id);
+		w.Put((int)Identifiable.GetId(go));
+		w.Put((int)(regionOf.TryGetValue(id, out var s) ? s : SetId.HOME));
+		w.Put(t.position);
+		w.Put(t.rotation);
+		w.Put(rb ? rb.velocity : Vector3.zero);
+		WriteState(w, go, upsert);
+		return w;
+	}
+
+	// ---------- per-actor state (trails ActorSpawn) ----------
+	// flags byte, then for each set bit in order:
+	//   1 fashions: count byte + ident int each   2 appearance: SaveSet byte
+	//   4 produce: state byte + progressTime double   8 feral: bool   0x80 Upsert (no payload)
+	class ActorState
+	{
+		public byte flags;
+		public readonly List<Identifiable.Id> fashions = new();
+		public SlimeAppearance.AppearanceSaveSet look;
+		public ResourceCycle.State prod;
+		public double t;
+		public bool feral;
+	}
+
+	static readonly ActorState state = new();
+
+	static void WriteState(NetDataWriter w, GameObject go, bool upsert)
+	{
+		var fa = go.GetComponent<AttachFashions>();
+		var look = go.GetComponent<SlimeAppearanceApplicator>();
+		var app = look && look.Appearance && look.Appearance.SaveSet != SlimeAppearance.AppearanceSaveSet.NONE ? look.Appearance : null;
+		var rc = go.GetComponent<ResourceCycle>();
+		var pm = rc ? produce(rc) : null;
+		var sf = go.GetComponent<SlimeFeral>();
+		var sm = sf ? feralModel(sf) : null;
+		w.Put((byte)((fa ? 1 : 0) | (app ? 2 : 0) | (pm != null ? 4 : 0) | (sm != null ? 8 : 0) | (upsert ? Upsert : 0)));
+		if (fa)
+		{
+			var list = fa.GetAllFashions();
+			w.Put((byte)list.Count);
+			foreach (var f in list) w.Put((int)f);
+		}
+		if (app) w.Put((byte)app.SaveSet);
+		if (pm != null)
+		{
+			w.Put((byte)pm.state);
+			w.Put(pm.progressTime);
+		}
+		if (sm != null) w.Put(sm.isFeral);
+	}
+
+	static ActorState ReadState(NetPacketReader r)
+	{
+		var s = state;
+		s.flags = r.AvailableBytes > 0 ? r.GetByte() : (byte)0;
+		s.fashions.Clear();
+		if ((s.flags & 1) != 0)
+			for (int n = r.GetByte(), i = 0; i < n; i++) s.fashions.Add((Identifiable.Id)r.GetInt());
+		if ((s.flags & 2) != 0) s.look = (SlimeAppearance.AppearanceSaveSet)r.GetByte();
+		if ((s.flags & 4) != 0)
+		{
+			s.prod = (ResourceCycle.State)r.GetByte();
+			s.t = r.GetDouble();
+		}
+		if ((s.flags & 8) != 0) s.feral = r.GetBool();
+		return s;
+	}
+
+	// Caller wraps in Session.Apply(). `full` = sender simulates it: produce/feral too, not just looks.
+	static void ApplyState(GameObject go, ActorState s, bool full)
+	{
+		var fa = go.GetComponent<AttachFashions>();
+		if (fa && (s.flags & 1) != 0 && !new HashSet<Identifiable.Id>(fa.GetAllFashions()).SetEquals(s.fashions))
+		{
+			var d = (IDictionary)slotted.GetValue(fa);
+			foreach (var e in d.Values)
+			{
+				var att = Traverse.Create(e).Field<GameObject>("gameObj").Value;
+				if (att) Destroyer.Destroy(att, "TailRanch.Fashion");
+			}
+			d.Clear();
+			fa.SetFashions(new List<Identifiable.Id>(s.fashions));
+		}
+
+		var look = go.GetComponent<SlimeAppearanceApplicator>();
+		if (look && look.SlimeDefinition && (s.flags & 2) != 0)
+		{
+			var app = look.SlimeDefinition.GetAppearanceForSet(s.look);
+			if (app)
+			{
+				var dir = SRSingleton<SceneContext>.Instance.SlimeAppearanceDirector;
+				if (dir && dir.GetChosenSlimeAppearance(look.SlimeDefinition) != app) dir.UpdateChosenSlimeAppearance(look.SlimeDefinition, app);
+				if (look.Appearance != app)
+				{
+					look.Appearance = app;
+					look.ApplyAppearance();
+				}
+			}
+		}
+		if (!full) return;
+
+		var rc = go.GetComponent<ResourceCycle>();
+		var pm = rc ? produce(rc) : null;
+		if (pm != null && (s.flags & 4) != 0)
+		{
+			if (pm.state == s.prod) pm.progressTime = s.t;
+			else
+			{
+				if (s.prod >= ResourceCycle.State.EDIBLE && pm.state < ResourceCycle.State.EDIBLE)
+				{
+					rc.Detach(null);
+					Unpin(go);
+				}
+				setInitState(rc, s.prod, s.t);
+			}
+		}
+
+		var sf = go.GetComponent<SlimeFeral>();
+		var sm = sf ? feralModel(sf) : null;
+		if (sm != null && (s.flags & 8) != 0 && sm.isFeral != s.feral)
+		{
+			if (s.feral) sf.SetFeral();
+			else sf.ClearFeral();
+		}
+	}
+
+	// Produce came off its joint: it is a free body now, also once the puppet lets go.
+	static void Unpin(GameObject go)
+	{
+		var p = go.GetComponent<ActorPuppet>();
+		if (p) p.Unpin();
+		else if (go.GetComponent<Rigidbody>() is { } rb && rb) rb.isKinematic = false;
+	}
+
+	// Queue a state upsert. ownedOnly: simulation state (produce, feral) only travels from the simulating machine.
+	static void Mark(GameObject go, bool ownedOnly)
+	{
+		if (!Session.Active || Session.Applying || (Session.IsClient && !entered) || !go || !idOf.TryGetValue(go, out var id)) return;
+		if (ownedOnly && !Owns(id)) return;
+		pendingState.Add(id);
+	}
 
 	// Client: first moment in the remote world. Strays spawned during load go; everything else becomes a puppet.
 	static bool Enter()
@@ -236,20 +486,11 @@ public static class ActorSync
 	static void Flush()
 	{
 		foreach (var id in pendingSpawns)
-		{
-			if (!objs.TryGetValue(id, out var go) || !go) continue;
-			var t = go.transform;
-			var rb = go.GetComponent<Rigidbody>();
-			var w = Packets.Begin(Op.ActorSpawn);
-			w.Put(id);
-			w.Put((int)Identifiable.GetId(go));
-			w.Put((int)(regionOf.TryGetValue(id, out var s) ? s : SetId.HOME));
-			w.Put(t.position);
-			w.Put(t.rotation);
-			w.Put(rb ? rb.velocity : Vector3.zero);
-			Session.Distribute(w, RO);
-		}
+			if (objs.TryGetValue(id, out var go) && go) Session.Distribute(SpawnPacket(id, go, false), RO);
+		foreach (var id in pendingState)
+			if (!pendingSpawns.Contains(id) && objs.TryGetValue(id, out var go) && go) Session.Distribute(SpawnPacket(id, go, true), RO);
 		pendingSpawns.Clear();
+		pendingState.Clear();
 		foreach (var id in pendingDespawns)
 			Session.Distribute(Packets.Begin(Op.ActorDespawn).Also(w => w.Put(id)), RO);
 		pendingDespawns.Clear();
@@ -275,9 +516,7 @@ public static class ActorSync
 			var rb = go.GetComponent<Rigidbody>();
 			if (Session.IsClient)
 			{
-				var vac = go.GetComponent<Vacuumable>();
-				var rest = (!go.activeInHierarchy || !rb || rb.isKinematic || rb.velocity.sqrMagnitude < 0.01f)
-					&& !(vac && (vac.isCaptive() || vac.isHeld()));
+				var rest = (!go.activeInHierarchy || !rb || rb.isKinematic || rb.velocity.sqrMagnitude < 0.01f) && !Captive(go);
 				if (!rest) restSince.Remove(id);
 				else if (!restSince.TryGetValue(id, out var t0)) restSince[id] = now;
 				else if (now - t0 > ReleaseAfter) release.Add(id);
@@ -300,6 +539,7 @@ public static class ActorSync
 
 		foreach (var id in release)
 		{
+			Session.SendToHost(SpawnPacket(id, objs[id], true), RO); // final state (ripeness, feral) before handing back
 			batch.Clear();
 			batch.Add(id);
 			SendMotion(batch, w => Session.SendToHost(w, RO));
@@ -333,12 +573,19 @@ public static class ActorSync
 	static void Forget(long id, GameObject go)
 	{
 		if ((object)go == null) objs.TryGetValue(id, out go);
+		else if (objs.TryGetValue(id, out var cur) && !ReferenceEquals(cur, go))
+		{
+			// Stale object for a reused id: drop only its reverse mapping.
+			idOf.Remove(go);
+			return;
+		}
 		if ((object)go != null) idOf.Remove(go);
 		objs.Remove(id);
 		regionOf.Remove(id);
 		owner.Remove(id);
 		lastSent.Remove(id);
 		restSince.Remove(id);
+		pendingState.Remove(id);
 	}
 
 	static void Purge()
@@ -355,6 +602,7 @@ public static class ActorSync
 		owner.Clear();
 		pendingSpawns.Clear();
 		pendingDespawns.Clear();
+		pendingState.Clear();
 		lastSent.Clear();
 		restSince.Clear();
 		loadStrays.Clear();
@@ -393,6 +641,7 @@ public static class ActorSync
 	{
 		var ident = Identifiable.GetId(go);
 		if (ident == Identifiable.Id.NONE || ident == Identifiable.Id.QUICKSILVER_SLIME || Identifiable.SCENE_OBJECTS.Contains(ident)) return;
+		if (objs.TryGetValue(id, out var prev) && (object)prev != null && !ReferenceEquals(prev, go)) idOf.Remove(prev);
 		objs[id] = go;
 		idOf[go] = id;
 		regionOf[id] = set;
@@ -535,6 +784,67 @@ public static class ActorSync
 		}
 	}
 
+	// A denied/revoked actor still animating into the vac must not turn into ammo.
+	[HarmonyPatch(typeof(Vacuumable), nameof(Vacuumable.TryConsume))]
+	static class OnConsume
+	{
+		static bool Prefix(Vacuumable __instance, ref bool __result)
+		{
+			if (Session.Applying || !IsRemoteOwned(__instance.gameObject)) return true;
+			__result = false;
+			return false;
+		}
+	}
+
+	// Hats: the machine simulating the fashion item resolves the hit; the wearer's looks go out as an upsert.
+	[HarmonyPatch]
+	static class FashionHit
+	{
+		static IEnumerable<MethodBase> TargetMethods() => Named(typeof(Fashion), "OnCollisionEnter").Concat(Named(typeof(FashionRemover), "OnCollisionEnter"));
+
+		static bool Prefix(Component __instance) => !IsRemoteOwned(__instance.gameObject);
+	}
+
+	[HarmonyPatch]
+	static class LooksChanged
+	{
+		static IEnumerable<MethodBase> TargetMethods() => Named(typeof(AttachFashions), "Attach").Concat(Named(typeof(AttachFashions), "DetachAll"));
+
+		static void Postfix(Component __instance) => Mark(__instance.gameObject, false);
+	}
+
+	[HarmonyPatch]
+	static class SimStateChanged
+	{
+		static IEnumerable<MethodBase> TargetMethods() => Named(typeof(SlimeFeral), "MakeFeral").Concat(Named(typeof(SlimeFeral), "MakeNotFeral"))
+			.Concat(Named(typeof(ResourceCycle), "Ripen")).Concat(Named(typeof(ResourceCycle), "MakeEdible")).Concat(Named(typeof(ResourceCycle), "Rot"));
+
+		static void Postfix(Component __instance) => Mark(__instance.gameObject, true);
+	}
+
+	// Ripe produce dropping off its joint on any machine (local ripening included).
+	[HarmonyPatch(typeof(ResourceCycle), "MakeEdible")]
+	static class ProduceDetached
+	{
+		static void Postfix(ResourceCycle __instance)
+		{
+			var p = __instance.GetComponent<ActorPuppet>();
+			if (p) p.Unpin();
+		}
+	}
+
+	// Chosen style (UI, treasure pod) re-skins every slime of that kind; push each one's new look.
+	[HarmonyPatch(typeof(SlimeAppearanceDirector), nameof(SlimeAppearanceDirector.UpdateChosenSlimeAppearance))]
+	static class StyleChosen
+	{
+		static void Postfix()
+		{
+			if (!Session.Active || Session.Applying) return;
+			foreach (var kv in objs)
+				if (kv.Value && kv.Value.GetComponent<SlimeAppearanceApplicator>()) Mark(kv.Value, false);
+		}
+	}
+
 	// Player actions on the client: spawns/despawns inside are real and broadcast.
 	[HarmonyPatch]
 	static class PlayerAction
@@ -589,7 +899,8 @@ public static class ActorSync
 			(typeof(RescueAmmoOnDeath), "SpawnRescuedItems"), (typeof(TransformChanceOnReproduce), "MaybeTransform"),
 			(typeof(GlitchTarrSterilizeOnWater), "WillDestroyAfterTime"), (typeof(LemonPhasor), "OnTriggerEnter"),
 			(typeof(DirectedCrateSpawner), "Spawn"), (typeof(DirectedAuxItemSpawner), "Spawn"), (typeof(PollenCloudController), "Update"),
-		}.SelectMany(x => Named(x.Item1, x.Item2));
+		}.SelectMany(x => Named(x.Item1, x.Item2))
+			.Where(m => m.Name != "Grow" || m.GetParameters().Length == 0); // Grow(GameObject) re-attaches synced produce
 
 		static bool Prefix() => !Session.IsClient;
 	}

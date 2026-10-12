@@ -36,8 +36,12 @@ public static class PlayerSync
 			var pos = r.GetVector3();
 			var yaw = r.GetFloat();
 			var pitch = r.GetFloat();
-			if (avatars.ContainsKey(id)) heard[id] = pos;
-			if (avatars.TryGetValue(id, out var a) && a) a.Push(pos, yaw, pitch);
+			// Avatar missing (joined before our world was up) or lost to a scene load: (re)create on demand.
+			if ((!avatars.TryGetValue(id, out var a) || !a) && id != Session.LocalId && Session.InWorld && Session.Players.TryGetValue(id, out var p))
+				avatars[id] = a = RemoteAvatar.Create(p);
+			if (!a) return;
+			heard[id] = pos;
+			a.Push(pos, yaw, pitch);
 		});
 	}
 
@@ -59,13 +63,16 @@ public static class PlayerSync
 		Session.Distribute(w, DeliveryMethod.Sequenced);
 	}
 
+	// Only replaces the avatar: a re-announced player keeps the actors it simulates.
 	public static void Spawn(Player p)
 	{
-		Despawn(p.Id);
+		if (avatars.TryGetValue(p.Id, out var old) && old) Object.Destroy(old.gameObject);
+		avatars.Remove(p.Id);
 		if (!Session.InWorld) return;
 		avatars[p.Id] = RemoteAvatar.Create(p);
 	}
 
+	// Player gone: avatar, held regions, and (host) every actor they simulated returns to the host.
 	public static void Despawn(byte id)
 	{
 		if (avatars.TryGetValue(id, out var a) && a) Object.Destroy(a.gameObject);
