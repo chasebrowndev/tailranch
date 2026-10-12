@@ -1,8 +1,11 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using LiteNetLib;
 using LiteNetLib.Utils;
+using TailRanch.Dev;
 using TailRanch.Sync;
 using UnityEngine.SceneManagement;
 
@@ -34,6 +37,7 @@ public static class Session
 	// Client: set once the remote world is running; stays until back at main menu so
 	// the borrowed world is never written to local saves.
 	public static bool InRemoteWorld;
+	static bool loadingRemote;
 
 	// Remote players by id (never contains the local player).
 	public static readonly Dictionary<byte, Player> Players = new();
@@ -42,6 +46,8 @@ public static class Session
 	static NetPeer hostPeer;
 	static readonly Dictionary<NetPeer, Player> byPeer = new();
 	static readonly Action<Player, NetPacketReader>[] handlers = new Action<Player, NetPacketReader>[256];
+	// Results from ThreadPool work, run on the main thread by Poll.
+	static readonly ConcurrentQueue<Action> mainQueue = new();
 
 	public static void On(Op op, Action<Player, NetPacketReader> h) => handlers[(byte)op] = h;
 
@@ -151,9 +157,27 @@ public static class Session
 	{
 		Stop("offline");
 		InRemoteWorld = false;
+		loadingRemote = false;
 	}
 
-	public static void Poll() => net?.PollEvents();
+	public static void Poll()
+	{
+		net?.PollEvents();
+		while (mainQueue.TryDequeue(out var a))
+		{
+			try { a(); }
+			catch (Exception e) { Plugin.Log.LogError(e); }
+		}
+	}
+
+	// PauseMenu.Quit's path (PauseMenu.cs:129) minus the save: the borrowed world is never saved.
+	static void ReturnToMenu()
+	{
+		Plugin.Log.LogInfo($"returning to main menu: {Status}");
+		UnityEngine.Time.timeScale = 1f;
+		SRSingleton<SceneContext>.Instance?.OnSessionEnded();
+		SceneManager.LoadScene("MainMenu");
+	}
 
 	static NetManager NewManager(EventBasedNetListener l) => new NetManager(l)
 	{
@@ -173,12 +197,18 @@ public static class Session
 				var w = Packets.Begin(Op.Hello);
 				w.Put(Plugin.Version);
 				w.Put(Plugin.PlayerName.Value);
-				peer.Send(w, DeliveryMethod.ReliableOrdered);
+				Send(peer, w, DeliveryMethod.ReliableOrdered);
 			}
 		};
 		l.PeerDisconnectedEvent += (peer, info) =>
 		{
-			if (IsClient) Stop($"disconnected: {Reason(info)}");
+			if (IsClient)
+			{
+				var inWorld = InRemoteWorld;
+				Stop($"{(inWorld || loadingRemote ? "host lost" : "disconnected")}: {Reason(info)}");
+				// Mid-load, OnWorld's callback returns to the menu once the scene is up.
+				if (inWorld) ReturnToMenu();
+			}
 			else if (byPeer.TryGetValue(peer, out var p))
 			{
 				byPeer.Remove(peer);
@@ -189,6 +219,7 @@ public static class Session
 		l.NetworkReceiveEvent += (peer, reader, _, _) =>
 		{
 			var op = reader.GetByte();
+			DevAuto.Count(false, op, reader.UserDataSize);
 			var h = handlers[op];
 			if (h == null) return;
 			Player from = null;
@@ -225,32 +256,79 @@ public static class Session
 		p.Name = name;
 		byPeer[p.Peer] = p;
 
-		p.Peer.Send(Packets.Begin(Op.Welcome).Also(w => w.Put(id)), DeliveryMethod.ReliableOrdered);
-		var bytes = RemoteSave.Snapshot();
+		SendTo(p, Packets.Begin(Op.Welcome).Also(w => w.Put(id)), DeliveryMethod.ReliableOrdered);
+		// Pull reads live transforms so it stays here; serialize + gzip on the ThreadPool.
+		var state = RemoteSave.Pull();
 		PlayerHello?.Invoke(p);
-		p.Peer.Send(Packets.Begin(Op.World).Also(w => w.PutBytesWithLength(bytes)), DeliveryMethod.ReliableOrdered);
-		Plugin.Log.LogInfo($"{name} joined as {id}, sent {bytes.Length / 1024} KiB world");
+		Plugin.Log.LogInfo($"{name} joined as {id}, packing world");
+		ThreadPool.QueueUserWorkItem(_ =>
+		{
+			try
+			{
+				var gz = RemoteSave.Pack(state, out var raw);
+				mainQueue.Enqueue(() => SendWorld(p, gz, raw));
+			}
+			catch (Exception e)
+			{
+				// A live list aliased by the snapshot changed mid-write; redo it where nothing moves.
+				mainQueue.Enqueue(() =>
+				{
+					Plugin.Log.LogWarning($"async world pack failed, packing on main thread: {e.Message}");
+					var gz = RemoteSave.Pack(state, out var raw);
+					SendWorld(p, gz, raw);
+				});
+			}
+		});
+	}
+
+	static void SendWorld(Player p, byte[] gz, int raw)
+	{
+		if (!byPeer.TryGetValue(p.Peer, out var cur) || cur != p || p.Peer.ConnectionState != ConnectionState.Connected)
+		{
+			Plugin.Log.LogInfo($"{p.Name} left before the world was sent");
+			return;
+		}
+		// Own writer so the shared one doesn't keep a multi-MiB buffer. LiteNetLib caps a message at
+		// 65535 fragments (~31 MiB at the 508-byte minimum MTU), far above a gzipped save.
+		var w = new NetDataWriter(false, gz.Length + 8);
+		w.Put((byte)Op.World);
+		w.PutBytesWithLength(gz);
+		SendTo(p, w, DeliveryMethod.ReliableOrdered);
+		Plugin.Log.LogInfo($"sent {p.Name} world: {gz.Length / 1024} KiB gzip, {raw / 1024} KiB raw");
 	}
 
 	static void OnWorld(Player _, NetPacketReader r)
 	{
-		var bytes = r.GetBytesWithLength();
-		Status = $"loading world ({bytes.Length / 1024} KiB)";
+		var gz = r.GetBytesWithLength();
+		var bytes = RemoteSave.Unpack(gz);
+		Status = $"loading world ({gz.Length / 1024} KiB)";
+		Plugin.Log.LogInfo($"world received: {gz.Length / 1024} KiB gzip, {bytes.Length / 1024} KiB raw");
+		loadingRemote = true;
 		RemoteSave.Load(bytes, () =>
 		{
+			loadingRemote = false;
 			InRemoteWorld = true;
+			if (!IsClient)
+			{
+				ReturnToMenu();
+				return;
+			}
 			Status = $"connected to {Plugin.JoinTarget.Value}";
 			SendToHost(Packets.Begin(Op.Ready), DeliveryMethod.ReliableOrdered);
-		}, () => Stop("world load failed"));
+		}, () =>
+		{
+			loadingRemote = false;
+			Stop("world load failed");
+		});
 	}
 
 	static void OnReady(Player p, NetPacketReader _)
 	{
 		p.Ready = true;
 		// New player learns about host + everyone else.
-		p.Peer.Send(JoinPacket(HostId, Plugin.PlayerName.Value), DeliveryMethod.ReliableOrdered);
+		SendTo(p, JoinPacket(HostId, Plugin.PlayerName.Value), DeliveryMethod.ReliableOrdered);
 		foreach (var q in byPeer.Values.Where(q => q.Ready && q != p))
-			p.Peer.Send(JoinPacket(q.Id, q.Name), DeliveryMethod.ReliableOrdered);
+			SendTo(p, JoinPacket(q.Id, q.Name), DeliveryMethod.ReliableOrdered);
 		Broadcast(JoinPacket(p.Id, p.Name), DeliveryMethod.ReliableOrdered, except: p);
 		AddPlayer(p.Id, p.Name, p);
 		PlayerReady?.Invoke(p);
@@ -274,15 +352,22 @@ public static class Session
 
 	// ---------- send ----------
 
-	public static void SendToHost(NetDataWriter w, DeliveryMethod m) => hostPeer?.Send(w, m);
+	static void Send(NetPeer peer, NetDataWriter w, DeliveryMethod m)
+	{
+		if (peer == null) return;
+		peer.Send(w, m);
+		DevAuto.Count(true, w.Data[0], w.Length);
+	}
+
+	public static void SendToHost(NetDataWriter w, DeliveryMethod m) => Send(hostPeer, w, m);
 
 	// Host: to one client.
-	public static void SendTo(Player p, NetDataWriter w, DeliveryMethod m) => p.Peer?.Send(w, m);
+	public static void SendTo(Player p, NetDataWriter w, DeliveryMethod m) => Send(p.Peer, w, m);
 
 	public static void Broadcast(NetDataWriter w, DeliveryMethod m, Player except = null)
 	{
 		foreach (var p in byPeer.Values)
-			if (p.Ready && p != except) p.Peer.Send(w, m);
+			if (p.Ready && p != except) Send(p.Peer, w, m);
 	}
 
 	// Host: to all clients. Client: to host (which relays).
@@ -296,7 +381,11 @@ public static class Session
 	public static void Relay(Player from, NetPacketReader r, DeliveryMethod m)
 	{
 		foreach (var p in byPeer.Values)
-			if (p.Ready && p != from) p.Peer.Send(r.RawData, r.UserDataOffset, r.UserDataSize, m);
+			if (p.Ready && p != from)
+			{
+				p.Peer.Send(r.RawData, r.UserDataOffset, r.UserDataSize, m);
+				DevAuto.Count(true, r.RawData[r.UserDataOffset], r.UserDataSize);
+			}
 	}
 
 	public static T Also<T>(this T t, Action<T> a)
