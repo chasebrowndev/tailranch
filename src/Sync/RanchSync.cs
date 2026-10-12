@@ -14,19 +14,38 @@ using UnityEngine;
 
 namespace TailRanch.Sync;
 
+// Ranch storage is host-authoritative: the host broadcasts full contents (SiloState,
+// StorageState) after any change; clients mutate optimistically and send deltas (SiloOp,
+// StorageState deltas) that the host validates, applies and answers with the full state.
 public static class RanchSync
 {
 	const DeliveryMethod R = DeliveryMethod.ReliableOrdered;
-	// SiloState storageType for the incinerator ash trough (LandPlotModel.ashUnits, one float).
+	// SiloState/SiloOp storageType for the incinerator ash trough (LandPlotModel.ashUnits, one float).
 	const int AshStorage = -1;
 
+	// CollectorPull kinds.
+	const byte PullStart = 0, PullStored = 1, PullRequest = 2;
+	// StorageState kinds.
+	const byte DecorState = 0, DecorDelta = 1, DecorSelect = 2, DecorCleanup = 3, GlitchState = 4, GlitchDelta = 5;
+	const int GlitchMax = 300; // GlitchStorage.MAX_COUNT
+
 	static readonly AccessTools.FieldRef<LandPlotModel, GameObject> plotObj = AccessTools.FieldRefAccess<LandPlotModel, GameObject>("gameObj");
+	static readonly AccessTools.FieldRef<Ammo, AmmoModel> ammoModel = AccessTools.FieldRefAccess<Ammo, AmmoModel>("ammoModel");
+	static readonly AccessTools.FieldRef<FillableAshSource, LandPlotModel> ashModel = AccessTools.FieldRefAccess<FillableAshSource, LandPlotModel>("plotModel");
 	static readonly MethodInfo updateAsh = AccessTools.Method(typeof(FillableAshSource), "UpdateAshPosition");
+	static readonly AccessTools.FieldRef<DecorizerModel, ReferenceCount<Identifiable.Id>> decorContents = AccessTools.FieldRefAccess<DecorizerModel, ReferenceCount<Identifiable.Id>>("contents");
+	static readonly AccessTools.FieldRef<DecorizerModel, Dictionary<string, DecorizerModel.Settings>> decorSettings = AccessTools.FieldRefAccess<DecorizerModel, Dictionary<string, DecorizerModel.Settings>>("settings");
 
 	// Every silo-like Ammo → its owning storage; player ammo never lands here.
 	static readonly ConditionalWeakTable<Ammo, SiloStorage> silos = new();
+	// Host: storages to broadcast.
 	static readonly HashSet<SiloStorage> dirtySilos = new();
 	static readonly HashSet<FillableAshSource> dirtyAsh = new();
+	static readonly HashSet<string> dirtyGlitch = new();
+	static bool dirtyDecor;
+	// Client: contents before the first unsent local change (diffed into SiloOps), and ash deltas.
+	static readonly Dictionary<Ammo, (Identifiable.Id id, int n)[]> baseline = new();
+	static readonly Dictionary<FillableAshSource, float> ashDelta = new();
 	static readonly HashSet<Gadget> dirtyGadgets = new();
 
 	static GameModel Game => SRSingleton<SceneContext>.Instance.GameModel;
@@ -35,7 +54,7 @@ public static class RanchSync
 
 	public static void Register()
 	{
-		if (Plugin.I) Plugin.I.gameObject.AddComponent<Pump>();
+		Wake();
 
 		On(Op.PlotReplace, r =>
 		{
@@ -49,7 +68,7 @@ public static class RanchSync
 		// upgrade >= 0: LandPlot.Upgrade. < 0: garden crop, -1 - Identifiable.Id (NONE = clear crop).
 		On(Op.PlotUpgrade, r =>
 		{
-			var plot = Plot(r.GetString())?.GetComponentInChildren<LandPlot>();
+			var plot = InPlot<LandPlot>(r.GetString());
 			var v = r.GetInt();
 			if (plot == null) return;
 			if (v >= 0)
@@ -66,32 +85,186 @@ public static class RanchSync
 				plot.GetComponentInChildren<GardenCatcher>(true)?.Plant(crop, isReplacement: false);
 		});
 
-		On(Op.SiloState, r =>
+		// h→c  storageId string (plotId, or siteId for warp depots), storageType int, then
+		//      ash: units float | ammo: n byte × (ident int, [count int, emo byte × (emotion byte, value float)])
+		Session.On(Op.SiloState, (_, r) =>
 		{
 			var id = r.GetString();
 			var type = r.GetInt();
+			if (Session.IsHost || !Session.InWorld) return;
 			if (type == AshStorage)
 			{
 				var units = r.GetFloat();
 				var m = Game.GetLandPlotModel(id);
-				var ash = Plot(id)?.GetComponentInChildren<FillableAshSource>(true);
 				if (m == null) return;
 				m.ashUnits = units;
+				var ash = InPlot<FillableAshSource>(id);
 				if (ash) updateAsh.Invoke(ash, null);
 				return;
 			}
 			var data = ReadAmmo(r);
 			var ammo = FindSilo(id, type)?.LocalAmmo;
-			if (ammo == null) return;
-			ammo.Clear();
-			ammo.FromSerializable(data);
+			if (Slots(ammo) == null) return;
+			// Unsent local edits are diffed against the pre-edit contents; send them before overwriting.
+			if (baseline.TryGetValue(ammo, out var before))
+			{
+				SendOps(ammo, before);
+				baseline.Remove(ammo);
+			}
+			using (Session.Apply())
+			{
+				ammo.Clear();
+				ammo.FromSerializable(data);
+			}
+		});
+
+		// c→h  storageId string, storageType int, then
+		//      ash: delta float | ammo: n byte × (slot byte, ident int, delta int)
+		// Host applies what still fits and always answers with SiloState (corrects the sender too).
+		Session.On(Op.SiloOp, (_, r) =>
+		{
+			var id = r.GetString();
+			var type = r.GetInt();
+			if (!Session.IsHost || !Session.InWorld) return;
+			if (type == AshStorage)
+			{
+				var d = r.GetFloat();
+				var ash = InPlot<FillableAshSource>(id);
+				var m = ash ? ashModel(ash) : null;
+				if (m == null) return;
+				m.ashUnits = Mathf.Clamp(m.ashUnits + d, 0f, ash.maxUnits);
+				updateAsh.Invoke(ash, null);
+				MarkAsh(ash);
+				return;
+			}
+			var n = r.GetByte();
+			var ops = new (int slot, Identifiable.Id id, int delta)[n];
+			for (var i = 0; i < n; i++) ops[i] = (r.GetByte(), (Identifiable.Id)r.GetInt(), r.GetInt());
+			var s = FindSilo(id, type);
+			if (s == null || Slots(s.LocalAmmo) == null) return;
+			foreach (var op in ops) ApplyOp(s.LocalAmmo, op.slot, op.id, op.delta);
+			MarkSilo(s);
 		});
 
 		On(Op.FeederSpeed, r =>
 		{
-			var feeder = Plot(r.GetString())?.GetComponentInChildren<SlimeFeeder>(true);
+			var feeder = InPlot<SlimeFeeder>(r.GetString());
 			var speed = (SlimeFeeder.FeedSpeed)r.GetInt();
 			if (feeder) feeder.SetFeederSpeed(speed);
+		});
+
+		// plotId string, kind byte, n byte.
+		//   h→c  PullStart: collector cycle began (n = plorts captured) → clients run the cyclone FX
+		//   h→c  PullStored: n plorts reached the collector → clients play collectFX
+		//   c→h  PullRequest: client pressed the collector button → host StartCollection
+		Session.On(Op.CollectorPull, (_, r) =>
+		{
+			var id = r.GetString();
+			var kind = r.GetByte();
+			var n = r.GetByte();
+			if (!Session.InWorld) return;
+			var c = InPlot<PlortCollector>(id);
+			if (c == null) return;
+			if (kind == PullRequest)
+			{
+				if (Session.IsHost) c.StartCollection();
+				return;
+			}
+			if (Session.IsHost) return;
+			using (Session.Apply())
+			{
+				if (kind == PullStart) Collector.forceUntil(c) = Collector.timeDir(c).HoursFromNow(1f / 6f);
+				else if (c.collectFX && c.collectPt)
+					for (var i = 0; i < Math.Min((int)n, 6); i++) SRBehaviour.SpawnAndPlayFX(c.collectFX, c.collectPt.position, c.collectPt.rotation);
+			}
+		});
+
+		// kind byte, then:
+		//   h→c  DecorState:   n ushort × (ident int, count int), m ushort × (decorizerId string, selected int)
+		//   c→h  DecorDelta:   ident int, delta int
+		//   c→h  DecorSelect:  decorizerId string, selected int
+		//   c→h  DecorCleanup: decorizerId string, n ushort × ident int (host runs DecorizerStorage.Cleanup)
+		//   h→c  GlitchState:  storageId string, ident int, count int
+		//   c→h  GlitchDelta:  storageId string, ident int, delta int
+		Session.On(Op.StorageState, (_, r) =>
+		{
+			var kind = r.GetByte();
+			if (!Session.InWorld) return;
+			var decor = Game.GetDecorizerModel();
+			switch (kind)
+			{
+				case DecorState when !Session.IsHost:
+				{
+					var contents = new Dictionary<Identifiable.Id, int>(Identifiable.idComparer);
+					for (int i = 0, n = r.GetUShort(); i < n; i++) contents[(Identifiable.Id)r.GetInt()] = r.GetInt();
+					var sel = new List<(string, Identifiable.Id)>();
+					for (int i = 0, n = r.GetUShort(); i < n; i++) sel.Add((r.GetString(), (Identifiable.Id)r.GetInt()));
+					using (Session.Apply())
+					{
+						decorContents(decor) = new ReferenceCount<Identifiable.Id>(contents, Identifiable.idComparer);
+						// In place: DecorizerStorage keeps a reference to its Settings object.
+						foreach (var (sid, s) in sel) decor.GetSettings(sid).selected = s;
+					}
+					break;
+				}
+				case DecorDelta when Session.IsHost:
+				{
+					var id = (Identifiable.Id)r.GetInt();
+					var d = r.GetInt();
+					for (var i = 0; i < d; i++) decor.Add(id);
+					for (var i = 0; i < -d && decor.GetCount(id) > 0; i++) decor.Remove(id);
+					dirtyDecor = true;
+					break;
+				}
+				case DecorSelect when Session.IsHost:
+				{
+					var sid = r.GetString();
+					var id = (Identifiable.Id)r.GetInt();
+					decor.GetSettings(sid).selected = id == Identifiable.Id.NONE || decor.GetCount(id) > 0 ? id : Identifiable.Id.NONE;
+					dirtyDecor = true;
+					break;
+				}
+				case DecorCleanup when Session.IsHost:
+				{
+					var sid = r.GetString();
+					var ids = new List<Identifiable.Id>();
+					for (int i = 0, n = r.GetUShort(); i < n; i++) ids.Add((Identifiable.Id)r.GetInt());
+					UnityEngine.Object.FindObjectsOfType<DecorizerStorage>().FirstOrDefault(s => s.id == sid)?.Cleanup(ids);
+					dirtyDecor = true;
+					break;
+				}
+				case GlitchState when !Session.IsHost:
+				{
+					var sid = r.GetString();
+					var id = (Identifiable.Id)r.GetInt();
+					var count = r.GetInt();
+					if (!Game.Glitch.storage.ContainsKey(sid)) return;
+					var m = Game.Glitch.storage[sid];
+					m.id = id;
+					m.count = count;
+					break;
+				}
+				case GlitchDelta when Session.IsHost:
+				{
+					var sid = r.GetString();
+					var id = (Identifiable.Id)r.GetInt();
+					var d = r.GetInt();
+					if (!Game.Glitch.storage.ContainsKey(sid)) return;
+					var m = Game.Glitch.storage[sid];
+					if (d > 0 && (m.count == 0 || m.id == id))
+					{
+						m.id = id;
+						m.count = Math.Min(GlitchMax, m.count + d);
+					}
+					else if (d < 0 && m.id == id)
+					{
+						m.count = Math.Max(0, m.count + d);
+						if (m.count == 0) m.id = Identifiable.Id.NONE;
+					}
+					MarkGlitch(sid);
+					break;
+				}
+			}
 		});
 
 		Session.On(Op.GadgetPlace, (from, r) =>
@@ -143,10 +316,27 @@ public static class RanchSync
 	static GameObject Plot(string id)
 	{
 		var m = Game.GetLandPlotModel(id);
-		return m == null ? null : plotObj(m);
+		var go = m == null ? null : plotObj(m);
+		return go ? go : null; // destroyed plot objects must not reach a ?. chain
 	}
 
-	static string PlotId(Component c) => c.GetComponentInParent<LandPlotLocation>()?.id;
+	static T InPlot<T>(string id) where T : Component
+	{
+		var p = Plot(id);
+		return p ? p.GetComponentInChildren<T>(true) : null;
+	}
+
+	// GetComponentInParent skips inactive objects; storages can sit under inactive upgrade roots.
+	static T Up<T>(Component c) where T : Component
+	{
+		for (var t = c ? c.transform : null; t; t = t.parent)
+			if (t.GetComponent<T>() is { } found) return found;
+		return null;
+	}
+
+	static string PlotId(Component c) => Up<LandPlotLocation>(c)?.id;
+
+	static string StorageId(SiloStorage s) => s is LinkedSiloStorage ? Up<GadgetSite>(s)?.id : PlotId(s);
 
 	static SiloStorage FindSilo(string id, int type)
 	{
@@ -183,13 +373,251 @@ public static class RanchSync
 		}
 	}
 
-	// ---------- silo contents (AmmoDataV02: id, count, emotions) ----------
-
-	static void WriteAmmo(NetDataWriter w, List<AmmoDataV02> data)
+	static void SendPull(PlortCollector c, byte kind, int n)
 	{
-		w.Put((byte)data.Count);
-		foreach (var d in data)
+		var id = PlotId(c);
+		if (id == null) return;
+		var w = Packets.Begin(Op.CollectorPull);
+		w.Put(id);
+		w.Put(kind);
+		w.Put((byte)Math.Min(n, 255));
+		if (Session.IsHost) Session.Broadcast(w, R);
+		else Session.SendToHost(w, R);
+	}
+
+	static void SendStorage(byte kind, Action<NetDataWriter> body)
+	{
+		var w = Packets.Begin(Op.StorageState);
+		w.Put(kind);
+		body(w);
+		if (Session.IsHost) Session.Broadcast(w, R);
+		else Session.SendToHost(w, R);
+	}
+
+	// ---------- coalescing pump ----------
+
+	static Pump pump;
+
+	// Own DontDestroyOnLoad object, recreated if anything ever destroys it.
+	static void Wake()
+	{
+		if (pump) return;
+		var go = new GameObject("TailRanch.RanchPump");
+		UnityEngine.Object.DontDestroyOnLoad(go);
+		pump = go.AddComponent<Pump>();
+	}
+
+	static void MarkSilo(SiloStorage s)
+	{
+		Wake();
+		dirtySilos.Add(s);
+	}
+
+	static void MarkAsh(FillableAshSource a)
+	{
+		Wake();
+		dirtyAsh.Add(a);
+	}
+
+	static void MarkGlitch(string id)
+	{
+		Wake();
+		if (id != null) dirtyGlitch.Add(id);
+	}
+
+	static void MarkDecor()
+	{
+		Wake();
+		dirtyDecor = true;
+	}
+
+	sealed class Pump : MonoBehaviour
+	{
+		void LateUpdate() => Flush();
+	}
+
+	static void Flush()
+	{
+		if (!Live || !Session.InWorld)
 		{
+			dirtySilos.Clear();
+			dirtyAsh.Clear();
+			dirtyGlitch.Clear();
+			dirtyDecor = false;
+			baseline.Clear();
+			ashDelta.Clear();
+			dirtyGadgets.Clear();
+			return;
+		}
+		if (Session.IsHost) FlushHost();
+		else FlushClient();
+		// Deferred so the post-placement RotateToPlayer is included.
+		foreach (var g in dirtyGadgets)
+		{
+			var site = g ? g.GetComponentInParent<GadgetSite>() : null;
+			if (site == null) continue;
+			var w = Packets.Begin(Op.GadgetPlace);
+			w.Put(site.id);
+			w.Put((int)g.id);
+			w.Put(g.GetRotation());
+			Session.Distribute(w, R);
+		}
+		dirtyGadgets.Clear();
+	}
+
+	static void FlushHost()
+	{
+		foreach (var s in dirtySilos)
+		{
+			var id = s ? StorageId(s) : null;
+			if (id == null || Slots(s.LocalAmmo) == null) continue;
+			var w = Packets.Begin(Op.SiloState);
+			w.Put(id);
+			w.Put((int)s.type);
+			WriteAmmo(w, s.LocalAmmo);
+			Session.Broadcast(w, R);
+		}
+		dirtySilos.Clear();
+		foreach (var a in dirtyAsh)
+		{
+			var id = a ? PlotId(a) : null;
+			var m = a ? ashModel(a) : null;
+			if (id == null || m == null) continue;
+			var w = Packets.Begin(Op.SiloState);
+			w.Put(id);
+			w.Put(AshStorage);
+			w.Put(m.ashUnits);
+			Session.Broadcast(w, R);
+		}
+		dirtyAsh.Clear();
+		if (dirtyDecor)
+		{
+			var decor = Game.GetDecorizerModel();
+			var contents = decorContents(decor).ToList();
+			var settings = decorSettings(decor).ToList();
+			SendStorage(DecorState, w =>
+			{
+				w.Put((ushort)contents.Count);
+				foreach (var kv in contents)
+				{
+					w.Put((int)kv.Key);
+					w.Put(kv.Value);
+				}
+				w.Put((ushort)settings.Count);
+				foreach (var kv in settings)
+				{
+					w.Put(kv.Key);
+					w.Put((int)kv.Value.selected);
+				}
+			});
+			dirtyDecor = false;
+		}
+		foreach (var sid in dirtyGlitch)
+		{
+			if (!Game.Glitch.storage.ContainsKey(sid)) continue;
+			var m = Game.Glitch.storage[sid];
+			SendStorage(GlitchState, w =>
+			{
+				w.Put(sid);
+				w.Put((int)m.id);
+				w.Put(m.count);
+			});
+		}
+		dirtyGlitch.Clear();
+	}
+
+	static void FlushClient()
+	{
+		foreach (var kv in baseline) SendOps(kv.Key, kv.Value);
+		baseline.Clear();
+		foreach (var kv in ashDelta)
+		{
+			var id = kv.Key ? PlotId(kv.Key) : null;
+			if (id == null || kv.Value == 0f) continue;
+			var w = Packets.Begin(Op.SiloOp);
+			w.Put(id);
+			w.Put(AshStorage);
+			w.Put(kv.Value);
+			Session.SendToHost(w, R);
+		}
+		ashDelta.Clear();
+	}
+
+	// ---------- silo contents ----------
+
+	static Ammo.Slot[] Slots(Ammo a) => a == null ? null : ammoModel(a)?.slots;
+
+	static (Identifiable.Id id, int n)[] Snap(Ammo a)
+	{
+		var slots = Slots(a);
+		if (slots == null) return null;
+		var snap = new (Identifiable.Id, int)[slots.Length];
+		for (var i = 0; i < slots.Length; i++)
+			snap[i] = slots[i] == null ? (Identifiable.Id.NONE, 0) : (slots[i].id, slots[i].count);
+		return snap;
+	}
+
+	// Client: per-slot diff of local edits since `before` → one SiloOp.
+	static void SendOps(Ammo ammo, (Identifiable.Id id, int n)[] before)
+	{
+		if (before == null || !silos.TryGetValue(ammo, out var s) || !s) return;
+		var id = StorageId(s);
+		var now = Snap(ammo);
+		if (id == null || now == null) return;
+		var ops = new List<(int slot, Identifiable.Id id, int delta)>();
+		for (var i = 0; i < Math.Min(before.Length, now.Length); i++)
+		{
+			var (b, c) = (before[i], now[i]);
+			if (b.id == c.id)
+			{
+				if (c.n != b.n && c.id != Identifiable.Id.NONE) ops.Add((i, c.id, c.n - b.n));
+				continue;
+			}
+			if (b.id != Identifiable.Id.NONE && b.n > 0) ops.Add((i, b.id, -b.n));
+			if (c.id != Identifiable.Id.NONE && c.n > 0) ops.Add((i, c.id, c.n));
+		}
+		if (ops.Count == 0) return;
+		var w = Packets.Begin(Op.SiloOp);
+		w.Put(id);
+		w.Put((int)s.type);
+		w.Put((byte)ops.Count);
+		foreach (var op in ops)
+		{
+			w.Put((byte)op.slot);
+			w.Put((int)op.id);
+			w.Put(op.delta);
+		}
+		Session.SendToHost(w, R);
+	}
+
+	// Host: apply one client delta. Adds overflow rather than lose an item the client already
+	// destroyed; removals clamp to what the host actually has.
+	static void ApplyOp(Ammo ammo, int slot, Identifiable.Id id, int delta)
+	{
+		var len = Slots(ammo).Length;
+		if (delta > 0)
+		{
+			if (slot < len && ammo.MaybeAddToSpecificSlot(id, null, slot, delta, true)) return;
+			for (var i = 0; i < delta; i++)
+				if (!ammo.MaybeAddToSlot(id, null)) break;
+			return;
+		}
+		int? idx = slot < len && ammo.GetSlotName(slot) == id ? slot : ammo.GetAmmoIdx(id);
+		if (idx is not { } k) return;
+		var take = Math.Min(-delta, ammo.GetSlotCount(k));
+		if (take > 0) ammo.Decrement(k, take);
+	}
+
+	// AmmoDataV02 per slot: id, count, emotions. Raw slot ids (ToSerializable reports water as MAGIC_WATER).
+	static void WriteAmmo(NetDataWriter w, Ammo ammo)
+	{
+		var data = ammo.ToSerializable();
+		var slots = Slots(ammo);
+		w.Put((byte)data.Count);
+		for (var i = 0; i < data.Count; i++)
+		{
+			var d = data[i];
+			if (slots[i] != null) d.id = slots[i].id;
 			w.Put((int)d.id);
 			if (d.id == Identifiable.Id.NONE) continue;
 			w.Put(d.count);
@@ -220,58 +648,6 @@ public static class RanchSync
 			data.Add(d);
 		}
 		return data;
-	}
-
-	static void Flush()
-	{
-		if (!Live || !Session.InWorld)
-		{
-			dirtySilos.Clear();
-			dirtyAsh.Clear();
-			dirtyGadgets.Clear();
-			return;
-		}
-		foreach (var s in dirtySilos)
-		{
-			if (!s) continue;
-			var id = s is LinkedSiloStorage ? s.GetComponentInParent<GadgetSite>()?.id : PlotId(s);
-			if (id == null) continue;
-			var w = Packets.Begin(Op.SiloState);
-			w.Put(id);
-			w.Put((int)s.type);
-			WriteAmmo(w, s.LocalAmmo.ToSerializable());
-			Session.Distribute(w, R);
-		}
-		dirtySilos.Clear();
-		foreach (var a in dirtyAsh)
-		{
-			var id = a ? PlotId(a) : null;
-			var m = id == null ? null : Game.GetLandPlotModel(id);
-			if (m == null) continue;
-			var w = Packets.Begin(Op.SiloState);
-			w.Put(id);
-			w.Put(AshStorage);
-			w.Put(m.ashUnits);
-			Session.Distribute(w, R);
-		}
-		dirtyAsh.Clear();
-		// Deferred so the post-placement RotateToPlayer is included.
-		foreach (var g in dirtyGadgets)
-		{
-			var site = g ? g.GetComponentInParent<GadgetSite>() : null;
-			if (site == null) continue;
-			var w = Packets.Begin(Op.GadgetPlace);
-			w.Put(site.id);
-			w.Put((int)g.id);
-			w.Put(g.GetRotation());
-			Session.Distribute(w, R);
-		}
-		dirtyGadgets.Clear();
-	}
-
-	sealed class Pump : MonoBehaviour
-	{
-		void LateUpdate() => Flush();
 	}
 
 	// ---------- plots ----------
@@ -314,18 +690,21 @@ public static class RanchSync
 
 	// ---------- silos ----------
 
-	[HarmonyPatch(typeof(SiloStorage), nameof(SiloStorage.Awake))]
+	// InitAmmo runs from Awake and InitModel, so storages under inactive roots are tracked too.
+	[HarmonyPatch(typeof(SiloStorage), "InitAmmo")]
 	static class TrackSilo
 	{
 		static void Postfix(SiloStorage __instance)
 		{
-			silos.Remove(__instance.LocalAmmo);
-			silos.Add(__instance.LocalAmmo, __instance);
+			var a = __instance.LocalAmmo;
+			if (a == null) return;
+			silos.Remove(a);
+			silos.Add(a, __instance);
 		}
 	}
 
-	// Every Ammo mutator (others funnel into these); silo catchers, collectors, feeders,
-	// drones and fast-forward all end up here.
+	// Every Ammo mutator (others funnel into these): catchers, collectors, feeders, drones,
+	// fast-forward. Host: mark for SiloState. Client: remember pre-edit contents for SiloOp.
 	[HarmonyPatch]
 	static class AmmoChanged
 	{
@@ -341,28 +720,140 @@ public static class RanchSync
 			yield return AccessTools.Method(t, nameof(Ammo.ReplaceWithQuicksilverAmmo));
 		}
 
+		static void Prefix(Ammo __instance)
+		{
+			if (!Live || Session.IsHost || baseline.ContainsKey(__instance) || !silos.TryGetValue(__instance, out _)) return;
+			var snap = Snap(__instance);
+			if (snap == null) return;
+			Wake();
+			baseline[__instance] = snap;
+		}
+
 		static void Postfix(Ammo __instance)
 		{
-			if (Live && silos.TryGetValue(__instance, out var s)) dirtySilos.Add(s);
+			if (Live && Session.IsHost && silos.TryGetValue(__instance, out var s)) MarkSilo(s);
 		}
 	}
 
 	[HarmonyPatch(typeof(FillableAshSource), nameof(FillableAshSource.AddAsh))]
 	static class AddAsh
 	{
-		static void Postfix(FillableAshSource __instance)
+		static void Prefix(FillableAshSource __instance, out float __state) => __state = ashModel(__instance)?.ashUnits ?? 0f;
+
+		static void Postfix(FillableAshSource __instance, float __state)
 		{
-			if (Live) dirtyAsh.Add(__instance);
+			if (!Live) return;
+			if (Session.IsHost)
+			{
+				MarkAsh(__instance);
+				return;
+			}
+			var m = ashModel(__instance);
+			if (m == null) return;
+			Wake();
+			ashDelta.TryGetValue(__instance, out var d);
+			ashDelta[__instance] = d + m.ashUnits - __state;
 		}
 	}
 
+	// Only host-simulated slimes eat ash.
 	[HarmonyPatch(typeof(FillableAshSource), nameof(FillableAshSource.ConsumeAsh))]
 	static class ConsumeAsh
 	{
+		static bool Prefix() => !Puppet;
+
 		static void Postfix(FillableAshSource __instance)
 		{
-			if (Live) dirtyAsh.Add(__instance);
+			if (Live && Session.IsHost) MarkAsh(__instance);
 		}
+	}
+
+	// ---------- decorizer + glitch (Viktor) storage ----------
+
+	[HarmonyPatch(typeof(DecorizerModel), nameof(DecorizerModel.Add))]
+	static class DecorAdd
+	{
+		static void Postfix(Identifiable.Id id, bool __result) => DecorChanged(id, 1, __result);
+	}
+
+	[HarmonyPatch(typeof(DecorizerModel), nameof(DecorizerModel.Remove))]
+	static class DecorRemove
+	{
+		static void Postfix(Identifiable.Id id, bool __result) => DecorChanged(id, -1, __result);
+	}
+
+	static void DecorChanged(Identifiable.Id id, int d, bool ok)
+	{
+		if (!ok || !Live) return;
+		if (Session.IsHost) MarkDecor();
+		else SendStorage(DecorDelta, w =>
+		{
+			w.Put((int)id);
+			w.Put(d);
+		});
+	}
+
+	[HarmonyPatch(typeof(DecorizerStorage), nameof(DecorizerStorage.selected), MethodType.Setter)]
+	static class DecorSelected
+	{
+		static void Postfix(DecorizerStorage __instance, Identifiable.Id value)
+		{
+			if (!Live) return;
+			if (Session.IsHost) MarkDecor();
+			else SendStorage(DecorSelect, w =>
+			{
+				w.Put(__instance.id);
+				w.Put((int)value);
+			});
+		}
+	}
+
+	// Cleanup pulls loose actors out of the cell; on a client those are host puppets.
+	[HarmonyPatch(typeof(DecorizerStorage), nameof(DecorizerStorage.Cleanup))]
+	static class DecorCleanupRoute
+	{
+		static bool Prefix(DecorizerStorage __instance, IEnumerable<Identifiable.Id> ids)
+		{
+			if (!Puppet) return true;
+			if (Live)
+			{
+				var list = ids.ToList();
+				SendStorage(DecorCleanup, w =>
+				{
+					w.Put(__instance.id);
+					w.Put((ushort)list.Count);
+					foreach (var id in list) w.Put((int)id);
+				});
+			}
+			return false;
+		}
+	}
+
+	[HarmonyPatch(typeof(GlitchStorage), nameof(GlitchStorage.Add))]
+	static class GlitchAdd
+	{
+		static void Postfix(GlitchStorage __instance, Identifiable.Id id, bool __result) => GlitchChanged(__instance, id, 1, __result);
+	}
+
+	[HarmonyPatch(typeof(GlitchStorage), nameof(GlitchStorage.Remove))]
+	static class GlitchRemove
+	{
+		static void Prefix(GlitchStorage __instance, out Identifiable.Id __state) => __state = __instance.selected;
+
+		static void Postfix(GlitchStorage __instance, Identifiable.Id __state, bool __result) => GlitchChanged(__instance, __state, -1, __result);
+	}
+
+	static void GlitchChanged(GlitchStorage s, Identifiable.Id id, int d, bool ok)
+	{
+		if (!ok || !Live) return;
+		var sid = s.id;
+		if (Session.IsHost) MarkGlitch(sid);
+		else SendStorage(GlitchDelta, w =>
+		{
+			w.Put(sid);
+			w.Put((int)id);
+			w.Put(d);
+		});
 	}
 
 	// ---------- gadgets ----------
@@ -372,7 +863,9 @@ public static class RanchSync
 	{
 		static void Postfix(GameObject __result, bool skipNotify)
 		{
-			if (!skipNotify && Live && __result.GetComponent<Gadget>() is { } g) dirtyGadgets.Add(g);
+			if (skipNotify || !Live || !(__result.GetComponent<Gadget>() is { } g)) return;
+			Wake();
+			dirtyGadgets.Add(g);
 		}
 	}
 
@@ -381,7 +874,9 @@ public static class RanchSync
 	{
 		static void Postfix(Gadget __instance)
 		{
-			if (Live && __instance.GetComponentInParent<GadgetSite>()) dirtyGadgets.Add(__instance);
+			if (!Live || !__instance.GetComponentInParent<GadgetSite>()) return;
+			Wake();
+			dirtyGadgets.Add(__instance);
 		}
 	}
 
@@ -438,31 +933,27 @@ public static class RanchSync
 		static bool Prefix(Collision col) => !ActorSync.IsRemoteOwned(col.gameObject);
 	}
 
-	// Collector joints on actors another machine simulates are dropped before they can be stored.
-	[HarmonyPatch]
-	static class CollectorOwner
+	// ---------- plort collectors: host collects, clients mirror the FX ----------
+
+	static class Collector
 	{
+		internal static readonly AccessTools.FieldRef<PlortCollector, double> forceUntil = AccessTools.FieldRefAccess<PlortCollector, double>("forceCollectUntil");
+		internal static readonly AccessTools.FieldRef<PlortCollector, TimeDirector> timeDir = AccessTools.FieldRefAccess<PlortCollector, TimeDirector>("timeDir");
+		internal static readonly AccessTools.FieldRef<PlortCollector, SECTR_AudioSource> vacAudio = AccessTools.FieldRefAccess<PlortCollector, SECTR_AudioSource>("vacAudio");
+		internal static readonly AccessTools.FieldRef<PlortCollector, int> animId = AccessTools.FieldRefAccess<PlortCollector, int>("animCycloneActiveId");
+		internal static readonly AccessTools.FieldRef<PlortCollector, SiloStorage> storage = AccessTools.FieldRefAccess<PlortCollector, SiloStorage>("storage");
 		static readonly FieldInfo joints = AccessTools.Field(typeof(PlortCollector), "joints");
 		static readonly Type jointRef = AccessTools.Inner(typeof(PlortCollector), "JointReference");
 		static readonly FieldInfo jointField = AccessTools.Field(jointRef, "joint");
 		static readonly MethodInfo destroy = AccessTools.Method(jointRef, "Destroy");
+		// Animator lives in UnityEngine.AnimationModule, which the project does not reference.
+		static readonly FieldInfo anim = AccessTools.Field(typeof(PlortCollector), "collectAnim");
+		static readonly MethodInfo setBool = AccessTools.Method(anim.FieldType, "SetBool", new[] { typeof(int), typeof(bool) });
 
-		static IEnumerable<MethodBase> TargetMethods()
-		{
-			yield return AccessTools.Method(typeof(PlortCollector), nameof(PlortCollector.Update));
-			yield return AccessTools.Method(typeof(PlortCollector), "DoCollection");
-		}
+		internal static int Joints(PlortCollector c) => ((IList)joints.GetValue(c)).Count;
 
-		static bool Prefix(PlortCollector __instance, MethodBase __originalMethod)
-		{
-			if (Puppet) return false;
-			if (__originalMethod.Name == nameof(PlortCollector.Update)) DropRemote(__instance);
-			return true;
-		}
-
-		static void Postfix(PlortCollector __instance) => DropRemote(__instance);
-
-		static void DropRemote(PlortCollector c)
+		// Joints on actors another machine simulates are dropped before they can be stored.
+		internal static void DropRemote(PlortCollector c)
 		{
 			var list = (IList)joints.GetValue(c);
 			for (var i = list.Count - 1; i >= 0; i--)
@@ -472,6 +963,76 @@ public static class RanchSync
 				destroy.Invoke(list[i], null);
 				list.RemoveAt(i);
 			}
+		}
+
+		internal static int Stored(PlortCollector c)
+		{
+			var slots = storage(c) is { } s && s ? Slots(s.GetRelevantAmmo()) : null;
+			return slots?.Sum(x => x?.count ?? 0) ?? 0;
+		}
+
+		// Client: Update's cyclone anim + vac audio, driven by forceCollectUntil from PullStart.
+		internal static void Visual(PlortCollector c)
+		{
+			var td = timeDir(c);
+			if (td == null) return;
+			var on = !td.HasReached(forceUntil(c));
+			if (anim.GetValue(c) is UnityEngine.Object an && an && setBool != null) setBool.Invoke(an, new object[] { animId(c), on });
+			var a = vacAudio(c);
+			if (a == null) return;
+			if (on && !a.IsPlaying) a.Play();
+			else if (!on && a.IsPlaying) a.Stop(false);
+		}
+	}
+
+	[HarmonyPatch(typeof(PlortCollector), nameof(PlortCollector.Update))]
+	static class CollectorUpdate
+	{
+		static bool Prefix(PlortCollector __instance, out int __state)
+		{
+			__state = 0;
+			if (Puppet)
+			{
+				Collector.Visual(__instance);
+				return false;
+			}
+			Collector.DropRemote(__instance);
+			if (Live) __state = Collector.Stored(__instance);
+			return true;
+		}
+
+		static void Postfix(PlortCollector __instance, int __state)
+		{
+			if (Puppet) return;
+			Collector.DropRemote(__instance);
+			if (!Live) return;
+			var n = Collector.Stored(__instance) - __state;
+			if (n > 0) SendPull(__instance, PullStored, n);
+		}
+	}
+
+	[HarmonyPatch(typeof(PlortCollector), "DoCollection")]
+	static class CollectorCollect
+	{
+		static bool Prefix() => !Puppet;
+
+		static void Postfix(PlortCollector __instance)
+		{
+			if (Puppet) return;
+			Collector.DropRemote(__instance);
+			if (Live) SendPull(__instance, PullStart, Collector.Joints(__instance));
+		}
+	}
+
+	// Collector button on a client: ask the host to run it.
+	[HarmonyPatch(typeof(PlortCollector), nameof(PlortCollector.StartCollection))]
+	static class CollectorButton
+	{
+		static bool Prefix(PlortCollector __instance)
+		{
+			if (!Puppet) return true;
+			if (Live) SendPull(__instance, PullRequest, 0);
+			return false;
 		}
 	}
 
