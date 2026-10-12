@@ -65,6 +65,14 @@ public static class ActorSync
 
 	static bool Owns(long id) => Session.IsClient ? owner.TryGetValue(id, out var o) && o == Session.LocalId : !owner.ContainsKey(id);
 
+	// Client: run a player action outside the patched entry points (spawns/despawns broadcast).
+	internal static void AsPlayer(Action a)
+	{
+		scope++;
+		try { a(); }
+		finally { scope--; }
+	}
+
 	public static void Register()
 	{
 		SceneManager.sceneLoaded += (_, _) => Purge();

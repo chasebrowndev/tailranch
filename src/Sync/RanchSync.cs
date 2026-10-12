@@ -49,6 +49,8 @@ public static class RanchSync
 	static readonly Dictionary<FillableAshSource, float> ashDelta = new();
 	// Client: SiloOps sent per silo and not yet answered (count, last send time).
 	static readonly Dictionary<Ammo, (int n, float at)> inFlight = new();
+	// Client: actors a silo ejected into the vac, until captured (destroyed) — take-back candidates.
+	static readonly List<GameObject> ejected = new();
 	static readonly HashSet<Gadget> dirtyGadgets = new();
 
 	static GameModel Game => SRSingleton<SceneContext>.Instance.GameModel;
@@ -89,8 +91,10 @@ public static class RanchSync
 		});
 
 		// h→c  storageId string (plotId, or siteId for warp depots), storageType int, then
-		//      ash: units float | ammo: n byte × (ident int, [count int, emo byte × (emotion byte, value float)]), ack bool
+		//      ash: units float | ammo: n byte × (ident int, [count int, emo byte × (emotion byte, value float)]), ack bool,
+		//      [ack: m byte × (ident int, shortfall int)]
 		// ack: the host's answer to one of this client's SiloOps (sent to the requester only).
+		// shortfall = requested - applied: > 0 adds that didn't fit, < 0 removes the host couldn't cover.
 		Session.On(Op.SiloState, (_, r) =>
 		{
 			var id = r.GetString();
@@ -108,6 +112,8 @@ public static class RanchSync
 			}
 			var data = ReadAmmo(r);
 			var ack = r.GetBool();
+			if (ack)
+				for (int i = 0, n = r.GetByte(); i < n; i++) Reconcile((Identifiable.Id)r.GetInt(), r.GetInt());
 			var ammo = FindSilo(id, type)?.LocalAmmo;
 			if (Slots(ammo) == null) return;
 			if (ack && inFlight.TryGetValue(ammo, out var f))
@@ -135,7 +141,7 @@ public static class RanchSync
 		// c→h  storageId string, storageType int, then
 		//      ash: delta float | ammo: n byte × (slot byte, ident int, delta int)
 		// Host applies what still fits and answers the sender with an ack SiloState (its corrected
-		// contents, rejected parts included), then broadcasts the change.
+		// contents plus the per-op shortfall the client must reconcile), then broadcasts the change.
 		Session.On(Op.SiloOp, (from, r) =>
 		{
 			var id = r.GetString();
@@ -157,8 +163,20 @@ public static class RanchSync
 			for (var i = 0; i < n; i++) ops[i] = (r.GetByte(), (Identifiable.Id)r.GetInt(), r.GetInt());
 			var s = FindSilo(id, type);
 			if (s == null || Slots(s.LocalAmmo) == null) return;
-			foreach (var op in ops) ApplyOp(s.LocalAmmo, op.slot, op.id, op.delta);
-			Session.SendTo(from, SiloPacket(s, true), R);
+			var miss = new List<(Identifiable.Id id, int n)>();
+			foreach (var op in ops)
+			{
+				var gap = op.delta - ApplyOp(s.LocalAmmo, op.slot, op.id, op.delta);
+				if (gap != 0) miss.Add((op.id, gap));
+			}
+			var w = SiloPacket(s, true);
+			w.Put((byte)miss.Count);
+			foreach (var m in miss)
+			{
+				w.Put((int)m.id);
+				w.Put(m.n);
+			}
+			Session.SendTo(from, w, R);
 			MarkSilo(s);
 		});
 
@@ -462,6 +480,7 @@ public static class RanchSync
 			dirtyDecor = false;
 			baseline.Clear();
 			inFlight.Clear();
+			ejected.Clear();
 			ashDelta.Clear();
 			dirtyGadgets.Clear();
 			return;
@@ -614,22 +633,76 @@ public static class RanchSync
 		inFlight[ammo] = ((inFlight.TryGetValue(ammo, out var f) ? f.n : 0) + 1, Time.time);
 	}
 
-	// Host: apply one client delta. Adds overflow rather than lose an item the client already
-	// destroyed; removals clamp to what the host actually has.
-	static void ApplyOp(Ammo ammo, int slot, Identifiable.Id id, int delta)
+	// Host: apply one client delta up to what fits / what the host has; returns the applied delta.
+	// The client reconciles the rest (refund or take back), so nothing overflows.
+	static int ApplyOp(Ammo ammo, int slot, Identifiable.Id id, int delta)
 	{
 		var len = Slots(ammo).Length;
 		if (delta > 0)
 		{
-			if (slot < len && ammo.MaybeAddToSpecificSlot(id, null, slot, delta, true)) return;
-			for (var i = 0; i < delta; i++)
-				if (!ammo.MaybeAddToSlot(id, null)) break;
-			return;
+			var before = Count(ammo, id);
+			if (slot < len)
+			{
+				var room = Math.Min(delta, ammo.GetSlotMaxCount(id, slot) - ammo.GetSlotCount(slot));
+				if (room > 0) ammo.MaybeAddToSpecificSlot(id, null, slot, room, false);
+			}
+			for (var i = 0; i < delta && Count(ammo, id) - before < delta && ammo.MaybeAddToSlot(id, null); i++) { }
+			return Math.Min(delta, Count(ammo, id) - before);
 		}
 		int? idx = slot < len && ammo.GetSlotName(slot) == id ? slot : ammo.GetAmmoIdx(id);
-		if (idx is not { } k) return;
+		if (idx is not { } k) return 0;
 		var take = Math.Min(-delta, ammo.GetSlotCount(k));
 		if (take > 0) ammo.Decrement(k, take);
+		return -Math.Max(take, 0);
+	}
+
+	static int Count(Ammo ammo, Identifiable.Id id) => Slots(ammo).Sum(x => x != null && x.id == id ? x.count : 0);
+
+	// Client: the host applied `gap` less than a SiloOp asked. Adds that didn't fit go back to the
+	// vac, or drop at the player's feet; removes it couldn't cover are taken back from the
+	// still-flying ejected actors, then the vac.
+	static void Reconcile(Identifiable.Id id, int gap)
+	{
+		var ctx = SRSingleton<SceneContext>.Instance;
+		var vac = ctx.PlayerState?.Ammo;
+		if (vac == null || id == Identifiable.Id.NONE) return;
+		if (gap > 0)
+		{
+			var drop = 0;
+			using (Session.Apply())
+				for (var i = 0; i < gap; i++)
+					if (!vac.MaybeAddToSlot(id, null)) drop++;
+			var prefab = drop > 0 && ctx.Player ? SRSingleton<GameContext>.Instance.LookupDirector.GetPrefab(id) : null;
+			if (prefab == null) return;
+			var t = ctx.Player.transform;
+			var set = ctx.RegionRegistry.GetCurrentRegionSetId();
+			ActorSync.AsPlayer(() =>
+			{
+				for (var i = 0; i < drop; i++)
+					SRBehaviour.InstantiateActor(prefab, set, t.position + t.forward + Vector3.up + UnityEngine.Random.insideUnitSphere * 0.3f, Quaternion.identity);
+			});
+			return;
+		}
+		var owe = -gap;
+		ejected.RemoveAll(go => !go);
+		ActorSync.AsPlayer(() =>
+		{
+			for (var i = ejected.Count - 1; i >= 0 && owe > 0; i--)
+			{
+				var go = ejected[i];
+				if (Identifiable.GetId(go) != id || ActorSync.IsRemoteOwned(go)) continue;
+				ejected.RemoveAt(i);
+				Destroyer.DestroyActor(go, "TailRanch.SiloTakeBack");
+				owe--;
+			}
+		});
+		using (Session.Apply())
+			while (owe > 0 && vac.GetAmmoIdx(id) is { } k)
+			{
+				var take = Math.Min(owe, vac.GetSlotCount(k));
+				vac.Decrement(k, take);
+				owe -= take;
+			}
 	}
 
 	// AmmoDataV02 per slot: id, count, emotions. Raw slot ids (ToSerializable reports water as MAGIC_WATER).
@@ -756,6 +829,18 @@ public static class RanchSync
 		static void Postfix(Ammo __instance)
 		{
 			if (Live && Session.IsHost && silos.TryGetValue(__instance, out var s)) MarkSilo(s);
+		}
+	}
+
+	// SiloCatcher.OnTriggerStay is ForceJoint's only caller: the ejected actor is on its way to the vac.
+	[HarmonyPatch(typeof(WeaponVacuum), nameof(WeaponVacuum.ForceJoint))]
+	static class SiloEject
+	{
+		static void Postfix(Vacuumable vacuumable)
+		{
+			if (!Live || Session.IsHost || !vacuumable) return;
+			ejected.RemoveAll(go => !go);
+			ejected.Add(vacuumable.gameObject);
 		}
 	}
 

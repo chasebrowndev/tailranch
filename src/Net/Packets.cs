@@ -25,7 +25,7 @@ public enum Op : byte
 	Progress,     // *    progressType int, value int
 	PlotReplace,  // *    plotId string, plotType int
 	PlotUpgrade,  // *    plotId string, upgrade int
-	SiloState,    // h→c  plotId string, storageType int, then full ammo slots + ack bool (RanchSync)
+	SiloState,    // h→c  plotId string, storageType int, then full ammo slots + ack bool [+ ack shortfalls] (RanchSync)
 	FeederSpeed,  // *    plotId string, speed int
 	GadgetPlace,  // *    siteId string, gadgetId int, yRot float
 	GadgetRemove, // *    siteId string
