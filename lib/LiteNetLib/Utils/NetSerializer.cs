@@ -3,7 +3,6 @@ using System.Reflection;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Net;
-using System.Runtime.Serialization;
 
 namespace LiteNetLib.Utils
 {
@@ -597,9 +596,6 @@ namespace LiteNetLib.Utils
                     elementType = propertyType.GetGenericArguments()[0];
                     callType = CallType.List;
                 }
-
-                if (Attribute.IsDefined(property, typeof(IgnoreDataMemberAttribute)))
-                    continue;
 
                 var getMethod = property.GetGetMethod();
                 var setMethod = property.GetSetMethod();
