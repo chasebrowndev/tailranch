@@ -43,7 +43,7 @@ public static class DevAuto
 	// Opens the pause menu once a session has a peer, so the docked panel can be screenshotted.
 	static void AutoPause()
 	{
-		if (paused || !Session.Active || !Session.InWorld || Session.Players.Count == 0) return;
+		if (paused || !Session.InWorld || !Plugin.DevSolo && (!Session.Active || Session.Players.Count == 0)) return;
 		if (pauseAt < 0f) pauseAt = Time.unscaledTime + 4f;
 		if (Time.unscaledTime < pauseAt) return;
 		var pm = SRSingleton<PauseMenu>.Instance;
@@ -80,7 +80,7 @@ public static class DevAuto
 			}
 		}
 		// Wait out OnGameLoadedCoroutine (push + loading UI) so the first snapshot is the real world.
-		if (!hosted && Session.InWorld && !SRSingleton<GameContext>.Instance.AutoSaveDirector.IsLoadingGame())
+		if (!hosted && !Plugin.DevSolo && Session.InWorld && !SRSingleton<GameContext>.Instance.AutoSaveDirector.IsLoadingGame())
 		{
 			hosted = true;
 			Session.Host();

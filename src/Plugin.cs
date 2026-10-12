@@ -31,7 +31,13 @@ public class Plugin : BaseUnityPlugin
 	public static readonly bool DevStats = System.Environment.GetEnvironmentVariable("TAILRANCH_STATS") == "1";
 	public static readonly string DevName = System.Environment.GetEnvironmentVariable("TAILRANCH_NAME") ?? "";
 	public static readonly bool DevLoopback = System.Environment.GetEnvironmentVariable("TAILRANCH_LOOPBACK") == "1";
-	public static readonly bool DevPause = System.Environment.GetEnvironmentVariable("TAILRANCH_PAUSE") == "1";
+	public static readonly bool DevPause = System.Environment.GetEnvironmentVariable("TAILRANCH_PAUSE") is "1" or "solo";
+	// TAILRANCH_PAUSE=solo: autohost loads the world but never hosts, then pauses (the offline in-world panel).
+	public static readonly bool DevSolo = System.Environment.GetEnvironmentVariable("TAILRANCH_PAUSE") == "solo";
+	// Pins one event card of every kind on screen (they otherwise fade after 4.5 s).
+	public static readonly bool DevCards = System.Environment.GetEnvironmentVariable("TAILRANCH_CARDS") == "1";
+	// Feeds the panel's latency meter a synthetic 20-70 ms round trip (loopback reads a flat 0 ms).
+	public static readonly bool DevPingDemo = System.Environment.GetEnvironmentVariable("TAILRANCH_PINGDEMO") == "1";
 
 	public static string Name => DevName.Length > 0 ? DevName : PlayerName.Value;
 

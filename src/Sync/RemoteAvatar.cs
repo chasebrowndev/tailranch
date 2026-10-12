@@ -21,7 +21,10 @@ public class RemoteAvatar : MonoBehaviour
 
 	readonly List<Snap> snaps = new();
 	Transform body, head, label;
-	TextMesh tag;
+	TextMesh tag, shade;
+	// Nametag: warm white over a soft dark under-copy so it holds over a bright sky; the slime itself carries the gold.
+	static readonly Color TagInk = new(1f, 0.97f, 0.9f), ShadeInk = new(0, 0, 0, 0.55f);
+	static readonly Vector3 ShadeOffset = new(0.012f, -0.012f, 0.01f);
 	float pitchScale = 1f, phase, speed, tagAlpha = 1f, nextOcclude;
 	bool occluded;
 
@@ -52,9 +55,21 @@ public class RemoteAvatar : MonoBehaviour
 		tm.fontSize = 48;
 		tm.characterSize = 0.05f;
 		tm.anchor = TextAnchor.MiddleCenter;
-		tm.color = Gold;
+		tm.color = TagInk;
+		var under = new GameObject("shade");
+		under.transform.SetParent(text.transform, false);
+		under.transform.localPosition = ShadeOffset; // behind along the label's forward, which faces away from the camera
+		var sm = under.AddComponent<TextMesh>();
+		sm.text = tm.text;
+		sm.font = tm.font;
+		under.GetComponent<MeshRenderer>().material = tm.font.material;
+		sm.fontSize = tm.fontSize;
+		sm.characterSize = tm.characterSize;
+		sm.anchor = tm.anchor;
+		sm.color = ShadeInk;
 		a.label = text.transform;
 		a.tag = tm;
+		a.shade = sm;
 		return a;
 	}
 
@@ -225,6 +240,7 @@ public class RemoteAvatar : MonoBehaviour
 		var dist = Vector3.Distance(from, label.position);
 		var want = (occluded ? 0.3f : 1f) * (1f - Mathf.InverseLerp(40f, 90f, dist));
 		tagAlpha = Mathf.Lerp(tagAlpha, want, 1f - Mathf.Exp(-8f * dt));
-		tag.color = new Color(Gold.r, Gold.g, Gold.b, tagAlpha);
+		tag.color = new Color(TagInk.r, TagInk.g, TagInk.b, tagAlpha);
+		shade.color = new Color(0, 0, 0, ShadeInk.a * tagAlpha);
 	}
 }
