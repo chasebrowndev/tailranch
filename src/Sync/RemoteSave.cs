@@ -47,9 +47,24 @@ public static class RemoteSave
 	public static void Load(byte[] bytes, Action onLoaded, Action onError)
 	{
 		pending = bytes;
-		// A failed load reverts to MainMenu without unsubscribing this, and MainMenu's SceneContext fires it.
-		SceneContext.onSceneLoaded += _ => { if (!Levels.isMainMenu()) onLoaded(); };
-		SRSingleton<GameContext>.Instance.AutoSaveDirector.BeginLoad("tailranch", Name, onError);
+		SceneContext.SceneLoadDelegate hook = null;
+		hook = _ =>
+		{
+			// A failed load reverts to MainMenu without clearing this, and MainMenu's SceneContext fires it.
+			// pending != bytes: this load was abandoned, so a later local save load must not trigger it.
+			if (Levels.isMainMenu() || pending != bytes) return;
+			pending = null;
+			// Runs ahead of AutoSaveDirector.OnGameLoaded in the same delegate chain; a throw here would skip the world push.
+			try { onLoaded(); }
+			catch (Exception e) { Plugin.Log.LogError($"remote world loaded callback: {e}"); }
+		};
+		SceneContext.onSceneLoaded += hook;
+		SRSingleton<GameContext>.Instance.AutoSaveDirector.BeginLoad("tailranch", Name, () =>
+		{
+			SceneContext.onSceneLoaded -= hook;
+			if (pending == bytes) pending = null;
+			onError();
+		});
 	}
 
 	[HarmonyPatch(typeof(FileStorageProvider), nameof(FileStorageProvider.GetGameData))]

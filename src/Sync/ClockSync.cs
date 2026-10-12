@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Reflection.Emit;
 using HarmonyLib;
 using LiteNetLib;
 using LiteNetLib.Utils;
@@ -158,14 +159,36 @@ public static class ClockSync
 	[HarmonyPatch]
 	static class MenuTimeScale
 	{
-		static IEnumerable<MethodBase> TargetMethods() => new MethodBase[]
+		static IEnumerable<MethodBase> TargetMethods()
 		{
-			AccessTools.Method(typeof(InputDirector), nameof(InputDirector.Update)),
-			AccessTools.Method(typeof(PauseMenu), nameof(PauseMenu.Update)),
-			AccessTools.Method(typeof(TimeDirector), nameof(TimeDirector.OnUnpause)),
-		};
+			var all = new[]
+			{
+				AccessTools.Method(typeof(InputDirector), nameof(InputDirector.Update)),
+				AccessTools.Method(typeof(PauseMenu), nameof(PauseMenu.Update)),
+				AccessTools.Method(typeof(TimeDirector), nameof(TimeDirector.OnUnpause)),
+			};
+			foreach (var m in all)
+				if (m != null) yield return m;
+				else Plugin.Log.LogWarning("MenuTimeScale: a target method is missing, skipped");
+		}
 
-		static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> code) =>
-			code.MethodReplacer(AccessTools.PropertyGetter(typeof(Time), nameof(Time.timeScale)), AccessTools.Method(typeof(ClockSync), nameof(TimeScale)));
+		// Fail-safe: swaps only exact `call Time.get_timeScale`; if none is found the body is returned untouched.
+		static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> code, MethodBase original)
+		{
+			var from = AccessTools.PropertyGetter(typeof(Time), nameof(Time.timeScale));
+			var to = AccessTools.Method(typeof(ClockSync), nameof(TimeScale));
+			var list = new List<CodeInstruction>(code);
+			var n = 0;
+			if (from != null && to != null)
+				foreach (var c in list)
+					if (c.Calls(from))
+					{
+						c.opcode = OpCodes.Call;
+						c.operand = to;
+						n++;
+					}
+			if (n == 0) Plugin.Log.LogWarning($"MenuTimeScale: no Time.timeScale read in {original?.DeclaringType?.Name}.{original?.Name}, left unchanged");
+			return list;
+		}
 	}
 }
