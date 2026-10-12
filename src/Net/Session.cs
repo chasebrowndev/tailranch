@@ -79,19 +79,27 @@ public static class Session
 	static Session()
 	{
 		On(Op.Hello, OnHello);
-		On(Op.Welcome, (_, r) => LocalId = r.GetByte());
+		On(Op.Welcome, (_, r) => { if (IsClient) LocalId = r.GetByte(); });
 		On(Op.World, OnWorld);
 		On(Op.Ready, OnReady);
-		On(Op.PlayerJoin, (_, r) => AddPlayer(r.GetByte(), r.GetString()));
-		On(Op.PlayerLeave, (_, r) => RemovePlayer(r.GetByte()));
-		PlayerSync.Register();
-		ClockSync.Register();
-		ActorSync.Register();
-		EconomySync.Register();
-		RanchSync.Register();
-		WorldSync.Register();
-		PresenceSync.Register();
-		ProfileSync.Register();
+		On(Op.PlayerJoin, (_, r) => { if (IsClient) AddPlayer(r.GetByte(), r.GetString()); });
+		On(Op.PlayerLeave, (_, r) => { if (IsClient) RemovePlayer(r.GetByte()); });
+		// One broken sync module (bad reflection target in its static init) must not take the
+		// whole Session type down with a TypeInitializationException.
+		Register("PlayerSync", PlayerSync.Register);
+		Register("ClockSync", ClockSync.Register);
+		Register("ActorSync", ActorSync.Register);
+		Register("EconomySync", EconomySync.Register);
+		Register("RanchSync", RanchSync.Register);
+		Register("WorldSync", WorldSync.Register);
+		Register("PresenceSync", PresenceSync.Register);
+		Register("ProfileSync", ProfileSync.Register);
+	}
+
+	static void Register(string name, Action register)
+	{
+		try { register(); }
+		catch (Exception e) { Plugin.Log.LogError($"{name}.Register failed: {e}"); }
 	}
 
 	// ---------- lifecycle ----------
@@ -114,6 +122,7 @@ public static class Session
 		if (!net.Start(Plugin.Port.Value))
 		{
 			Status = $"could not bind UDP {Plugin.Port.Value}";
+			Plugin.Log.LogError(Status);
 			net = null;
 			return;
 		}
@@ -138,7 +147,13 @@ public static class Session
 
 		Plugin.JoinTarget.Value = target;
 		net = NewManager(Listener());
-		net.Start();
+		if (!net.Start())
+		{
+			Status = "could not open a UDP socket";
+			Plugin.Log.LogError(Status);
+			net = null;
+			return;
+		}
 		hostPeer = net.Connect(ip.ToString(), Plugin.Port.Value, Key);
 		Mode = Mode.Client;
 		Status = $"connecting to {target} ({ip})";
@@ -148,13 +163,19 @@ public static class Session
 	public static void Stop(string why)
 	{
 		if (!Active) return;
-		net.Stop(true);
+		var n = net;
 		net = null;
 		hostPeer = null;
 		byPeer.Clear();
-		foreach (var id in Players.Keys.ToList()) PlayerSync.Despawn(id);
-		Players.Clear();
 		Mode = Mode.Off;
+		try { n?.Stop(true); }
+		catch (Exception e) { Plugin.Log.LogError($"net stop: {e}"); }
+		foreach (var id in Players.Keys.ToList())
+		{
+			try { PlayerSync.Despawn(id); }
+			catch (Exception e) { Plugin.Log.LogError($"despawn {id}: {e}"); }
+		}
+		Players.Clear();
 		Status = why;
 		Plugin.Log.LogInfo($"session stopped: {why}");
 	}
@@ -168,7 +189,10 @@ public static class Session
 
 	public static void Poll()
 	{
-		net?.PollEvents();
+		// Handlers are guarded individually; this catches LiteNetLib itself so the rest of
+		// Plugin.Update (and the next frame's poll) still runs.
+		try { net?.PollEvents(); }
+		catch (Exception e) { Plugin.Log.LogError($"poll: {e}"); }
 		while (mainQueue.TryDequeue(out var a))
 		{
 			try { a(); }
@@ -224,6 +248,8 @@ public static class Session
 		};
 		l.NetworkReceiveEvent += (peer, reader, _, _) =>
 		{
+			// Stop() inside an earlier event of the same PollEvents batch leaves the rest queued.
+			if (!Active || reader.AvailableBytes < 1) return;
 			var op = reader.GetByte();
 			DevAuto.Count(false, op, reader.UserDataSize);
 			var h = handlers[op];
@@ -247,6 +273,7 @@ public static class Session
 
 	static void OnHello(Player p, NetPacketReader r)
 	{
+		if (!IsHost || byPeer.ContainsKey(p.Peer)) return;
 		var ver = r.GetString();
 		var name = r.GetString();
 		if (ver != Plugin.Version)
@@ -305,6 +332,7 @@ public static class Session
 
 	static void OnWorld(Player _, NetPacketReader r)
 	{
+		if (!IsClient || loadingRemote || InRemoteWorld) return;
 		var gz = r.GetBytesWithLength();
 		var bytes = RemoteSave.Unpack(gz);
 		Status = $"loading world ({gz.Length / 1024} KiB)";
@@ -330,6 +358,7 @@ public static class Session
 
 	static void OnReady(Player p, NetPacketReader _)
 	{
+		if (!IsHost || p.Ready) return;
 		p.Ready = true;
 		foreach (var (data, m) in p.Pending) p.Peer.Send(data, m);
 		p.Pending = null;

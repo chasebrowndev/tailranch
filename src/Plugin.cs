@@ -55,23 +55,49 @@ public class Plugin : BaseUnityPlugin
 		gameObject.AddComponent<Panel>();
 		SceneManager.sceneLoaded += (scene, _) =>
 		{
+			Log.LogInfo($"scene loaded: {scene.name}");
 			if (scene.name == "MainMenu")
-				Session.OnMainMenu();
+			{
+				try { Session.OnMainMenu(); }
+				catch (System.Exception e) { Log.LogError(e); }
+			}
 		};
 		Log.LogInfo($"TailRanch {Version} loaded");
 	}
 
+	// Each tick isolated: one module throwing every frame must not starve the others (or the net poll).
+	static readonly (string name, System.Action tick)[] ticks =
+	{
+		("Session", Session.Poll),
+		("DevAuto", DevAuto.Tick),
+		("PlayerSync", PlayerSync.Tick),
+		("ClockSync", ClockSync.Tick),
+		("ActorSync", ActorSync.Tick),
+		("WorldSync", WorldSync.Tick),
+		("PresenceSync", PresenceSync.Tick),
+		("ProfileSync", ProfileSync.Tick),
+	};
+	static readonly string[] lastError = new string[ticks.Length];
+
 	void Update()
 	{
-		Session.Poll();
-		DevAuto.Tick();
-		PlayerSync.Tick();
-		ClockSync.Tick();
-		ActorSync.Tick();
-		WorldSync.Tick();
-		PresenceSync.Tick();
-		ProfileSync.Tick();
+		for (var i = 0; i < ticks.Length; i++)
+		{
+			try { ticks[i].tick(); }
+			catch (System.Exception e)
+			{
+				// Log each distinct failure once instead of every frame.
+				var msg = e.ToString();
+				if (msg == lastError[i]) continue;
+				lastError[i] = msg;
+				Log.LogError($"{ticks[i].name}.Tick: {msg}");
+			}
+		}
 	}
 
-	void OnApplicationQuit() => Session.Stop("quit");
+	void OnApplicationQuit()
+	{
+		try { Session.Stop("quit"); }
+		catch (System.Exception e) { Log.LogError(e); }
+	}
 }

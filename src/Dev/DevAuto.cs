@@ -10,10 +10,10 @@ namespace TailRanch.Dev;
 public static class DevAuto
 {
 	const float MenuSettle = 2f, JoinRetry = 5f, StatsInterval = 5f;
-	const int MaxJoinTries = 24;
+	const int MaxJoinTries = 60;
 
 	static float menuSince = -1f;
-	static bool hostLoadStarted, hosted, joined;
+	static bool hostLoadStarted, hosted, joined, menuLogged, giveUpLogged;
 	static int joinTries;
 	static float nextJoin, nextStats;
 
@@ -27,6 +27,11 @@ public static class DevAuto
 		}
 		else menuSince = -1f;
 		var menuReady = menuSince >= 0f && Time.unscaledTime - menuSince >= MenuSettle;
+		if (menuReady && !menuLogged && (Plugin.DevAutoHost || Plugin.DevAutoJoin.Length > 0))
+		{
+			menuLogged = true;
+			Plugin.Log.LogInfo("dev: main menu ready");
+		}
 
 		if (Plugin.DevAutoHost) AutoHost(menuReady);
 		if (Plugin.DevAutoJoin.Length > 0) AutoJoin(menuReady);
@@ -39,6 +44,11 @@ public static class DevAuto
 		{
 			hostLoadStarted = true;
 			var asd = SRSingleton<GameContext>.Instance.AutoSaveDirector;
+			if (asd.IsLoadingGame())
+			{
+				hostLoadStarted = false; // something else is loading; try again once it settles
+				return;
+			}
 			var newest = asd.AvailableGamesByGameName().Values.SelectMany(l => l)
 				.Where(s => !s.isInvalid && !s.gameOver)
 				.OrderByDescending(s => s.saveTimestamp).FirstOrDefault();
@@ -54,7 +64,8 @@ public static class DevAuto
 					() => Plugin.Log.LogError("dev autohost: new game failed"));
 			}
 		}
-		if (!hosted && Session.InWorld)
+		// Wait out OnGameLoadedCoroutine (push + loading UI) so the first snapshot is the real world.
+		if (!hosted && Session.InWorld && !SRSingleton<GameContext>.Instance.AutoSaveDirector.IsLoadingGame())
 		{
 			hosted = true;
 			Session.Host();
@@ -69,11 +80,18 @@ public static class DevAuto
 			joined = true;
 			return;
 		}
-		if (!menuReady || Session.Active || joinTries >= MaxJoinTries || Time.unscaledTime < nextJoin) return;
+		if (joinTries >= MaxJoinTries)
+		{
+			if (!giveUpLogged) Plugin.Log.LogWarning($"dev autojoin: gave up after {MaxJoinTries} tries ({Session.Status})");
+			giveUpLogged = true;
+			return;
+		}
+		if (!menuReady || Session.Active || Time.unscaledTime < nextJoin) return;
 		joinTries++;
 		nextJoin = Time.unscaledTime + JoinRetry;
-		Plugin.Log.LogInfo($"dev autojoin: {Plugin.DevAutoJoin} (try {joinTries}/{MaxJoinTries})");
+		Plugin.Log.LogInfo($"dev autojoin: {Plugin.DevAutoJoin} (try {joinTries}/{MaxJoinTries}, last: {Session.Status})");
 		Session.Join(Plugin.DevAutoJoin);
+		if (!Session.Active) Plugin.Log.LogWarning($"dev autojoin: join did not start: {Session.Status}");
 	}
 
 	public static void Count(bool sent, byte op, int bytes)

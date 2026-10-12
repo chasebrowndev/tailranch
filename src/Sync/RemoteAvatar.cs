@@ -169,7 +169,7 @@ public class RemoteAvatar : MonoBehaviour
 	static Transform Part(PrimitiveType type, Transform parent, Vector3 pos, Vector3 scale)
 	{
 		var go = GameObject.CreatePrimitive(type);
-		Object.Destroy(go.GetComponent<Collider>());
+		Object.DestroyImmediate(go.GetComponent<Collider>()); // deferred Destroy would leave a solid collider for a frame
 		go.transform.SetParent(parent, false);
 		go.transform.localPosition = pos;
 		go.transform.localScale = scale;
