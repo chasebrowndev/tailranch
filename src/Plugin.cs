@@ -48,7 +48,7 @@ public class Plugin : BaseUnityPlugin
 	// Each instance chats on a loop over the real network path; the client also opens its composer with a draft.
 	public static readonly bool DevChatDemo = System.Environment.GetEnvironmentVariable("TAILRANCH_CHATDEMO") == "1";
 
-	public static string Name => DevName.Length > 0 ? DevName : PlayerName.Value;
+	public static string Name => DevName.Length > 0 ? DevName : PlayerName.Value.Trim().Length > 0 ? PlayerName.Value.Trim() : System.Environment.MachineName;
 
 	void Awake()
 	{
