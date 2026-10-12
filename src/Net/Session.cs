@@ -94,6 +94,7 @@ public static class Session
 		Register("WorldSync", WorldSync.Register);
 		Register("PresenceSync", PresenceSync.Register);
 		Register("ProfileSync", ProfileSync.Register);
+		Register("Chat", UI.Chat.Register);
 	}
 
 	static void Register(string name, Action register)

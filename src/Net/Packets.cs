@@ -45,6 +45,7 @@ public enum Op : byte
 	ExchangeState,  // EconomySync
 	StorageState,   // RanchSync (decorizer, glitch storage)
 	Profile,        // ProfileSync (kind byte + payload: upgrades, blueprints, gadget counts, pedia, mail)
+	Chat,           // c→h  text string; h→* senderId byte, senderName string, text string (host-stamped, sender included)
 }
 
 public static class Packets
