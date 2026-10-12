@@ -21,7 +21,9 @@ public class RemoteAvatar : MonoBehaviour
 
 	readonly List<Snap> snaps = new();
 	Transform body, head, label;
-	float pitchScale = 1f, phase, speed;
+	TextMesh tag;
+	float pitchScale = 1f, phase, speed, tagAlpha = 1f, nextOcclude;
+	bool occluded;
 
 	public static RemoteAvatar Create(Player p)
 	{
@@ -52,6 +54,7 @@ public class RemoteAvatar : MonoBehaviour
 		tm.anchor = TextAnchor.MiddleCenter;
 		tm.color = Gold;
 		a.label = text.transform;
+		a.tag = tm;
 		return a;
 	}
 
@@ -210,6 +213,18 @@ public class RemoteAvatar : MonoBehaviour
 		body.localPosition = new Vector3(0, Mathf.Max(0, -Mathf.Cos(phase)) * 0.08f * mv, 0);
 
 		var cam = Camera.main;
-		if (cam) label.rotation = Quaternion.LookRotation(label.position - cam.transform.position);
+		if (!cam) return;
+		label.rotation = Quaternion.LookRotation(label.position - cam.transform.position);
+		// The font shader draws through walls: dim the tag when occluded, fade it out with distance.
+		var from = cam.transform.position;
+		if (Time.unscaledTime > nextOcclude)
+		{
+			nextOcclude = Time.unscaledTime + 0.2f;
+			occluded = Physics.Linecast(from, label.position, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
+		}
+		var dist = Vector3.Distance(from, label.position);
+		var want = (occluded ? 0.3f : 1f) * (1f - Mathf.InverseLerp(40f, 90f, dist));
+		tagAlpha = Mathf.Lerp(tagAlpha, want, 1f - Mathf.Exp(-8f * dt));
+		tag.color = new Color(Gold.r, Gold.g, Gold.b, tagAlpha);
 	}
 }
