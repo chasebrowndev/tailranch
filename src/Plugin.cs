@@ -66,6 +66,9 @@ public class Plugin : BaseUnityPlugin
 		PlayerSync.Tick();
 		ClockSync.Tick();
 		ActorSync.Tick();
+		WorldSync.Tick();
+		PresenceSync.Tick();
+		ProfileSync.Tick();
 	}
 
 	void OnApplicationQuit() => Session.Stop("quit");

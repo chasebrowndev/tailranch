@@ -30,6 +30,20 @@ public enum Op : byte
 	GadgetPlace,  // *    siteId string, gadgetId int, yRot float
 	GadgetRemove, // *    siteId string
 	Refinery,     // c→h  ident int, delta int; h→c ident int, total int
+
+	// Gap-fix wave: layouts documented next to each handler in the owning file.
+	ActorDeny,      // ActorSync
+	GordoState,     // WorldSync
+	PodState,       // WorldSync
+	EchoState,      // WorldSync
+	GadgetState,    // WorldSync
+	PlayerRegion,   // PresenceSync
+	DroneMotion,    // PresenceSync
+	SiloOp,         // RanchSync
+	CollectorPull,  // RanchSync
+	MarketState,    // EconomySync
+	ExchangeState,  // EconomySync
+	StorageState,   // RanchSync (decorizer, glitch storage)
 }
 
 public static class Packets

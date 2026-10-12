@@ -89,6 +89,9 @@ public static class Session
 		ActorSync.Register();
 		EconomySync.Register();
 		RanchSync.Register();
+		WorldSync.Register();
+		PresenceSync.Register();
+		ProfileSync.Register();
 	}
 
 	// ---------- lifecycle ----------
