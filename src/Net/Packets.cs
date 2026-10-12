@@ -7,7 +7,7 @@ public enum Op : byte
 {
 	Hello,       // c→h  version, name
 	Welcome,     // h→c  your id
-	World,       // h→c  save bytes
+	World,       // h→c  gzipped save bytes
 	Ready,       // c→h  world loaded
 	PlayerJoin,  // h→*  id, name
 	PlayerLeave, // h→*  id
