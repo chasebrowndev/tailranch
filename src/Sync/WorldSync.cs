@@ -77,20 +77,20 @@ public static class WorldSync
 			if (g == null) return;
 			var target = g.GetTargetCount();
 			var old = g.GetEatenCount();
+			if (Session.IsHost)
+			{
+				var now = old;
+				if (old != -1)
+				{
+					now = old + v;
+					using (Session.Apply()) setEaten.Invoke(g, new object[] { now });
+					if (old < target && now >= target) Burst(g); // outside Apply: a dormant burst spawns the rewards now, and they must reach clients
+				}
+				Session.Broadcast(GordoPacket(key, now), R);
+				return;
+			}
 			using (Session.Apply())
 			{
-				if (Session.IsHost)
-				{
-					var now = old;
-					if (old != -1)
-					{
-						now = old + v;
-						setEaten.Invoke(g, new object[] { now });
-						if (old < target && now >= target) Burst(g);
-					}
-					Session.Broadcast(GordoPacket(key, now), R);
-					return;
-				}
 				if (old == -1 || old >= target) return; // burst done or under way here
 				if (v == -1 || v >= target)
 				{
@@ -145,20 +145,23 @@ public static class WorldSync
 				if (Session.IsHost) Session.SendTo(from, EchoPacket(id), R);
 				return;
 			}
-			using (Session.Apply())
+			if (Session.IsHost)
 			{
-				if (Session.IsHost)
+				if (g.gameObject.activeInHierarchy)
 				{
-					if (g.gameObject.activeInHierarchy)
-					{
-						m.state = EchoNoteGordoModel.State.POPPING_2;
-						g.OnAnimationEvent_Popped(); // spawns the notes, unlocks instruments
-					}
+					m.state = EchoNoteGordoModel.State.POPPING_2;
+					g.OnAnimationEvent_Popped(); // spawns the notes, unlocks instruments; outside Apply so the notes reach clients as actors
+				}
+				using (Session.Apply())
+				{
 					if (m.state != EchoNoteGordoModel.State.POPPED) UnlockEcho(g, m); // region asleep here: no notes
 					HideEcho(g);
-					Session.Broadcast(EchoPacket(id), R);
-					return;
 				}
+				Session.Broadcast(EchoPacket(id), R);
+				return;
+			}
+			using (Session.Apply())
+			{
 				var animating = m.state == EchoNoteGordoModel.State.POPPING_2;
 				UnlockEcho(g, m);
 				// Mid-animation, its StateExit hides the gordo; make sure it ends up hidden either way.
