@@ -73,6 +73,8 @@ public class RemoteAvatar : MonoBehaviour
 		return a;
 	}
 
+	public void SetName(string name) => tag.text = shade.text = name;
+
 	float BuildSlime()
 	{
 		var ctx = SRSingleton<GameContext>.Instance;

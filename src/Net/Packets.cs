@@ -47,6 +47,7 @@ public enum Op : byte
 	Profile,        // ProfileSync (kind byte + payload: upgrades, blueprints, gadget counts, pedia, mail)
 	Chat,           // c→h  text string; h→* senderId byte, senderName string, text string (host-stamped, sender included)
 	Craft,          // RanchSync (refinery fabricate: c→h gadgetId int, host spends; h→c gadgetId int, refused)
+	Rename,         // c→h  name string; h→* id byte, name string (host-stamped, cleaned)
 }
 
 public static class Packets

@@ -399,7 +399,7 @@ public class Panel : MonoBehaviour
 			GUILayout.Space(S.Block);
 		}
 		GUILayout.BeginVertical(well);
-		Row(Plugin.Name, "you", -1, null);
+		You();
 		foreach (var p in Session.Players.Values.ToList()) // kick disconnects synchronously and edits Players
 		{
 			Hairline();
@@ -570,6 +570,37 @@ public class Panel : MonoBehaviour
 		GUILayout.FlexibleSpace();
 		GUILayout.EndHorizontal();
 	}
+
+	// Your own row is the name field: commits on Enter or when focus leaves, then syncs live.
+	void You()
+	{
+		if (Plugin.DevName.Length > 0) { Row(Plugin.Name, "you", -1, null); return; }
+		var ev = Event.current;
+		var focused = GUI.GetNameOfFocusedControl() == "tr-name";
+		if (focused && ev.type == EventType.KeyDown && (ev.keyCode == KeyCode.Return || ev.keyCode == KeyCode.KeypadEnter))
+		{
+			GUI.FocusControl(null);
+			focused = false;
+			ev.Use();
+		}
+		if (!focused && nameDraft != null)
+		{
+			var old = Plugin.Name;
+			Plugin.PlayerName.Value = nameDraft.Trim();
+			nameDraft = null;
+			if (Plugin.Name != old) Session.Rename();
+		}
+		GUILayout.BeginHorizontal(GUILayout.Height(S.RowH));
+		var shown = nameDraft ?? Plugin.Name;
+		GUI.SetNextControlName("tr-name");
+		var next = GUILayout.TextField(shown, 32, field);
+		if (next != shown) nameDraft = next;
+		GUILayout.Space(S.InlineGap);
+		GUILayout.Label("you", tag);
+		GUILayout.EndHorizontal();
+	}
+
+	string nameDraft;
 
 	void Row(string name, string tagText, int ms, Player kickable)
 	{

@@ -19,6 +19,7 @@ public class Player
 	public string Name;
 	public NetPeer Peer; // host side only
 	public bool Ready;
+	public float RenamedAt = -1; // host: rename rate limit
 	// Host: reliable broadcasts that happened after this joiner's snapshot but before
 	// their world finished loading; flushed on Ready.
 	public System.Collections.Generic.List<(byte[] data, DeliveryMethod m)> Pending = new();
@@ -83,6 +84,7 @@ public static class Session
 		On(Op.World, OnWorld);
 		On(Op.Ready, OnReady);
 		On(Op.PlayerJoin, (_, r) => { if (IsClient) AddPlayer(r.GetByte(), r.GetString()); });
+		On(Op.Rename, OnRename);
 		On(Op.PlayerLeave, (_, r) => { if (IsClient) RemovePlayer(r.GetByte()); });
 		// One broken sync module (bad reflection target in its static init) must not take the
 		// whole Session type down with a TypeInitializationException.
@@ -383,6 +385,34 @@ public static class Session
 
 	static NetDataWriter JoinPacket(byte id, string name) =>
 		Packets.Begin(Op.PlayerJoin).Also(w => { w.Put(id); w.Put(name); });
+
+	// Local name changed mid-session: the host applies and announces it, a client asks the host.
+	public static void Rename()
+	{
+		if (IsHost) SetName(HostId, Plugin.Name);
+		else if (IsClient) SendToHost(Packets.Begin(Op.Rename).Also(w => w.Put(Plugin.Name)), DeliveryMethod.ReliableOrdered);
+	}
+
+	static void OnRename(Player from, NetPacketReader r)
+	{
+		if (!IsHost) { SetName(r.GetByte(), r.GetString()); return; }
+		var now = UnityEngine.Time.unscaledTime;
+		if (!from.Ready || from.RenamedAt >= 0 && now - from.RenamedAt < 1f) return;
+		from.RenamedAt = now;
+		SetName(from.Id, r.GetString()); // the id comes from the connection, never the packet
+	}
+
+	static void SetName(byte id, string name)
+	{
+		var sb = new System.Text.StringBuilder();
+		foreach (var ch in name ?? "")
+			if (!char.IsControl(ch) && sb.Length < 32) sb.Append(ch);
+		name = sb.ToString().Trim();
+		if (name.Length == 0) return;
+		if (Players.TryGetValue(id, out var p)) p.Name = name;
+		PlayerSync.Rename(id, name);
+		if (IsHost) Broadcast(Packets.Begin(Op.Rename).Also(w => { w.Put(id); w.Put(name); }), DeliveryMethod.ReliableOrdered);
+	}
 
 	static void AddPlayer(byte id, string name, Player p = null)
 	{

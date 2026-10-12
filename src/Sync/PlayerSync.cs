@@ -72,6 +72,11 @@ public static class PlayerSync
 		avatars[p.Id] = RemoteAvatar.Create(p);
 	}
 
+	public static void Rename(byte id, string name)
+	{
+		if (avatars.TryGetValue(id, out var a) && a) a.SetName(name);
+	}
+
 	// Player gone: avatar, held regions, and (host) every actor they simulated returns to the host.
 	public static void Despawn(byte id)
 	{

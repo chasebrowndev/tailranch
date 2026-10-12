@@ -31,7 +31,7 @@ Only tailnet addresses (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) are accepted. UD
 | Key | Default | |
 |---|---|---|
 | `Net.Port` | 7777 | UDP port the host listens on |
-| `Net.PlayerName` | | Name above your avatar |
+| `Net.PlayerName` | | Name above your avatar (also editable in the co-op panel, live mid-session) |
 | `Net.JoinTarget` | | Last joined host |
 
 ## Build
