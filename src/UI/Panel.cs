@@ -25,7 +25,7 @@ namespace TailRanch.UI;
 public class Panel : MonoBehaviour
 {
 	// ── Tokens — mirror EclipseOS shell/crates/ec-ui/src/tokens.rs. No literal colour or size below this block. ──
-	static class C
+	internal static class C
 	{
 		public static readonly Color Accent = Hex(0xf2c33c);
 		public static readonly Color AccentText = Hex(0xf5cf5c);
@@ -58,16 +58,16 @@ public class Panel : MonoBehaviour
 		public static readonly Color History = W(0.16f);
 		public static readonly Color Track = W(0.10f);
 		public static readonly Color Selection = A(Accent, 0.35f);
-		public const float ShadowAlpha = 0.42f;
+		public const float ShadowAlpha = 0.42f, FeedShadowAlpha = 0.24f; // feed: a stack of small capsules, so a lighter drop each
 		public const float Clear = 0f;
 	}
 
-	static class R // radius
+	internal static class R // radius
 	{
 		public const float Panel = 16, Well = 10, Pill = 15, Inline = 13, Card = 20, Chip = 11, Focus = 7; // Inline: half of S.FieldH, so its 9-slice borders never overlap
 	}
 
-	static class S // space, px at the 800-line reference height
+	internal static class S // space, px at the 800-line reference height
 	{
 		public const float Width = 268, ChipW = 92, DockedCards = 2, Margin = 28, MenuTop = 0.36f; // MenuTop: fraction of the screen under the title logo
 		public const int PadX = 18, PadTop = 16, PadBottom = 12;
@@ -78,25 +78,30 @@ public class Panel : MonoBehaviour
 		public const float CardH = 40, CardGap = 8, CardMinW = 220, CardMaxW = 460, CardPadX = 16, CardGlyph = 6, CardGlyphGap = 12, CardTagGap = 18;
 		public const float Shadow = 26, ShadowDrop = 8, CardShadow = 20, CardDrop = 5, Slide = 14, DockSlide = 18;
 		public const int Tex = 64, TexSmall = 32, ShadowTex = 96;
+		// Chat (Chat.cs): bottom-left column above the vitals; ChatBottom is a fraction of the screen height.
+		public const float ChatW = 300, ChatBottom = 0.79f, ChatLineH = 26, ChatLinePadX = 12, ChatLineGap = 6, ChatNameGap = 8;
+		public const float ChatHistMax = 196, ChatWellPad = 10, ChatFootH = 16, ChatFootGap = 6, ChatShadow = 14, ChatDrop = 3;
+		public const int ChatFeed = 5, ChatHistory = 60;
 	}
 
-	static class Z // type size
+	internal static class Z // type size
 	{
 		public const int Title = 14, Body = 12, Small = 11, Micro = 9, Big = 28, Unit = 12, Step = 15, Kick = 14;
 	}
 
-	static class M // motion, seconds
+	internal static class M // motion, seconds
 	{
 		public const float Dock = 0.22f, Ease = 14f, CardEase = 12f, CardLife = 4.5f, CardIn = 0.28f, CardOut = 0.45f;
 		public const float Sample = 0.5f, Pulse = 4f;
+		public const float ChatLife = 9f, ChatIn = 0.25f, ChatOut = 1.2f, ChatOpen = 0.16f, ChatDenied = 1.5f;
 	}
 
 	const string RecentKey = "TailRanch.Recent";
 	const int MaxCards = 4, PingGood = 80, PingOk = 160;
 
-	static Color Hex(int h) => new(((h >> 16) & 255) / 255f, ((h >> 8) & 255) / 255f, (h & 255) / 255f);
-	static Color W(float a) => new(1, 1, 1, a);
-	static Color A(Color c, float a) => new(c.r, c.g, c.b, a);
+	internal static Color Hex(int h) => new(((h >> 16) & 255) / 255f, ((h >> 8) & 255) / 255f, (h & 255) / 255f);
+	internal static Color W(float a) => new(1, 1, 1, a);
+	internal static Color A(Color c, float a) => new(c.r, c.g, c.b, a);
 
 	enum Tone { Plain, Live, Alarm }
 
@@ -106,6 +111,9 @@ public class Panel : MonoBehaviour
 		public Tone Tone;
 		public float Born, Y = -1;
 	}
+
+	// Docked panel visibility (0..1) and its bottom edge (reference px), so the chat feed can sit beneath it.
+	internal static float DockVis, DockBottom;
 
 	readonly List<Card> cards = new();
 	readonly Dictionary<byte, string> known = new();
@@ -150,7 +158,8 @@ public class Panel : MonoBehaviour
 		Track();
 		Sample();
 		var dt = Time.unscaledDeltaTime;
-		vis = Mathf.MoveTowards(vis, Docked() ? 1 : 0, dt / M.Dock);
+		vis = Mathf.MoveTowards(vis, Docked() && !Chat.Typing ? 1 : 0, dt / M.Dock); // the left column is chat's while typing
+		DockVis = vis;
 		shownH = Mathf.Lerp(shownH, height, 1 - Mathf.Exp(-M.Ease * dt));
 		if (!Plugin.DevCards) cards.RemoveAll(c => Time.unscaledTime - c.Born > M.CardLife);
 		var y = S.Margin;
@@ -316,6 +325,7 @@ public class Panel : MonoBehaviour
 		var x = S.Margin - S.DockSlide * (1 - e);
 		var y = Mathf.Max(S.Margin, (sh - shownH) * 0.5f);
 		if (OnMenu) y = Mathf.Max(y, sh * S.MenuTop); // below the title logo
+		DockBottom = y + shownH;
 		GUI.color = W(e);
 		if (Repaint) shadow.Draw(new Rect(x - S.Shadow, y - S.Shadow + S.ShadowDrop, S.Width + 2 * S.Shadow, height + 2 * S.Shadow), false, false, false, false);
 
@@ -724,13 +734,13 @@ public class Panel : MonoBehaviour
 		};
 	}
 
-	static Texture2D New(int w, int h) => new(w, h, TextureFormat.RGBA32, false)
+	internal static Texture2D New(int w, int h) => new(w, h, TextureFormat.RGBA32, false)
 	{
 		wrapMode = TextureWrapMode.Clamp, filterMode = FilterMode.Bilinear, hideFlags = HideFlags.HideAndDontSave,
 	};
 
 	// Signed distance to a rounded rect inset by `inset` px; negative inside.
-	static float Sdf(float px, float py, int size, float inset, float r)
+	internal static float Sdf(float px, float py, int size, float inset, float r)
 	{
 		var h = size * 0.5f - inset;
 		var qx = Mathf.Max(Mathf.Abs(px - size * 0.5f) - (h - r), 0);
@@ -739,7 +749,7 @@ public class Panel : MonoBehaviour
 	}
 
 	// Anti-aliased rounded rect: fill, 1px rim brighter toward the top, highlight band in the top cap (stays put under 9-slicing).
-	static Texture2D Rounded(int size, float r, Color fill, Color rim, Color top, float topH)
+	internal static Texture2D Rounded(int size, float r, Color fill, Color rim, Color top, float topH)
 	{
 		var t = New(size, size);
 		var px = new Color[size * size];
@@ -764,7 +774,7 @@ public class Panel : MonoBehaviour
 		return t;
 	}
 
-	static Texture2D Soft(int size, float inset, float r, float alpha)
+	internal static Texture2D Soft(int size, float inset, float r, float alpha)
 	{
 		var t = New(size, size);
 		var px = new Color[size * size];

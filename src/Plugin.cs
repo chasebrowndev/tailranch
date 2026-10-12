@@ -38,6 +38,8 @@ public class Plugin : BaseUnityPlugin
 	public static readonly bool DevCards = System.Environment.GetEnvironmentVariable("TAILRANCH_CARDS") == "1";
 	// Feeds the panel's latency meter a synthetic 20-70 ms round trip (loopback reads a flat 0 ms).
 	public static readonly bool DevPingDemo = System.Environment.GetEnvironmentVariable("TAILRANCH_PINGDEMO") == "1";
+	// Each instance chats on a loop over the real network path; the client also opens its composer with a draft.
+	public static readonly bool DevChatDemo = System.Environment.GetEnvironmentVariable("TAILRANCH_CHATDEMO") == "1";
 
 	public static string Name => DevName.Length > 0 ? DevName : PlayerName.Value;
 
@@ -62,6 +64,7 @@ public class Plugin : BaseUnityPlugin
 		}
 		Log.LogInfo($"patched {ok} classes, {failed} failed");
 		gameObject.AddComponent<Panel>();
+		gameObject.AddComponent<Chat>();
 		SceneManager.sceneLoaded += (scene, _) =>
 		{
 			Log.LogInfo($"scene loaded: {scene.name}");
