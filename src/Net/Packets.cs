@@ -12,6 +12,24 @@ public enum Op : byte
 	PlayerJoin,  // h→*  id, name
 	PlayerLeave, // h→*  id
 	PlayerPos,   // *    id, pos, yaw, pitch
+
+	Clock,        // h→c  worldTime double, fastForwardUntil double?
+	ActorSpawn,   // *    actorId long, ident int, regionSet int, pos, rot, vel
+	ActorDespawn, // *    actorId long
+	ActorMotion,  // *    count ushort, then per actor: actorId long, pos, rot, vel
+	ActorClaim,   // *    actorId long, owner byte (c→h request; h→* grant)
+	ActorRelease, // *    actorId long (back to host)
+	Money,        // c→h  delta int; h→c total int
+	Keys,         // c→h  delta int; h→c total int
+	Door,         // *    doorId string, state int
+	Progress,     // *    progressType int, value int
+	PlotReplace,  // *    plotId string, plotType int
+	PlotUpgrade,  // *    plotId string, upgrade int
+	SiloState,    // *    plotId string, storageType int, then full ammo slots
+	FeederSpeed,  // *    plotId string, speed int
+	GadgetPlace,  // *    siteId string, gadgetId int, yRot float
+	GadgetRemove, // *    siteId string
+	Refinery,     // c→h  ident int, delta int; h→c ident int, total int
 }
 
 public static class Packets
@@ -44,4 +62,12 @@ public static class Packets
 	}
 
 	public static Quaternion GetQuaternion(this NetDataReader r) => new Quaternion(r.GetFloat(), r.GetFloat(), r.GetFloat(), r.GetFloat());
+
+	public static void Put(this NetDataWriter w, double? d)
+	{
+		w.Put(d.HasValue);
+		if (d.HasValue) w.Put(d.Value);
+	}
+
+	public static double? GetNullableDouble(this NetDataReader r) => r.GetBool() ? r.GetDouble() : null;
 }

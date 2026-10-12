@@ -24,7 +24,7 @@
     <Reference Include="$(Managed)/UnityEngine.TextRenderingModule.dll" Private="false" />
   </ItemGroup>
 
-  <Target Name="Deploy" AfterTargets="Build">
+  <Target Name="Deploy" AfterTargets="Build" Condition="'$(NoDeploy)' != 'true'">
     <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(GameDir)/BepInEx/plugins/TailRanch" />
   </Target>
 </Project>

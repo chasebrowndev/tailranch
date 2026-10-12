@@ -45,6 +45,23 @@ public static class Session
 
 	public static void On(Op op, Action<Player, NetPacketReader> h) => handlers[(byte)op] = h;
 
+	// True while replaying a remote change; sync patches must not re-broadcast then.
+	public static bool Applying { get; private set; }
+
+	public static IDisposable Apply() => new ApplyScope();
+
+	sealed class ApplyScope : IDisposable
+	{
+		readonly bool prev = Applying;
+		public ApplyScope() => Applying = true;
+		public void Dispose() => Applying = prev;
+	}
+
+	// Host: fired right after a joiner's save snapshot is taken (start buffering world
+	// events for them), and when they report their world loaded (flush + initial state).
+	public static event Action<Player> PlayerHello;
+	public static event Action<Player> PlayerReady;
+
 	public static bool InWorld => SceneManager.GetActiveScene().name == "worldGenerated"
 		&& SRSingleton<SceneContext>.Instance != null && SRSingleton<SceneContext>.Instance.Player != null;
 
@@ -59,6 +76,10 @@ public static class Session
 		On(Op.PlayerJoin, (_, r) => AddPlayer(r.GetByte(), r.GetString()));
 		On(Op.PlayerLeave, (_, r) => RemovePlayer(r.GetByte()));
 		PlayerSync.Register();
+		ClockSync.Register();
+		ActorSync.Register();
+		EconomySync.Register();
+		RanchSync.Register();
 	}
 
 	// ---------- lifecycle ----------
@@ -206,6 +227,7 @@ public static class Session
 
 		p.Peer.Send(Packets.Begin(Op.Welcome).Also(w => w.Put(id)), DeliveryMethod.ReliableOrdered);
 		var bytes = RemoteSave.Snapshot();
+		PlayerHello?.Invoke(p);
 		p.Peer.Send(Packets.Begin(Op.World).Also(w => w.PutBytesWithLength(bytes)), DeliveryMethod.ReliableOrdered);
 		Plugin.Log.LogInfo($"{name} joined as {id}, sent {bytes.Length / 1024} KiB world");
 	}
@@ -231,6 +253,7 @@ public static class Session
 			p.Peer.Send(JoinPacket(q.Id, q.Name), DeliveryMethod.ReliableOrdered);
 		Broadcast(JoinPacket(p.Id, p.Name), DeliveryMethod.ReliableOrdered, except: p);
 		AddPlayer(p.Id, p.Name, p);
+		PlayerReady?.Invoke(p);
 	}
 
 	static NetDataWriter JoinPacket(byte id, string name) =>
@@ -252,6 +275,9 @@ public static class Session
 	// ---------- send ----------
 
 	public static void SendToHost(NetDataWriter w, DeliveryMethod m) => hostPeer?.Send(w, m);
+
+	// Host: to one client.
+	public static void SendTo(Player p, NetDataWriter w, DeliveryMethod m) => p.Peer?.Send(w, m);
 
 	public static void Broadcast(NetDataWriter w, DeliveryMethod m, Player except = null)
 	{
