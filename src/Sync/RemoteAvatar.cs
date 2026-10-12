@@ -238,7 +238,7 @@ public class RemoteAvatar : MonoBehaviour
 			occluded = Physics.Linecast(from, label.position, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
 		}
 		var dist = Vector3.Distance(from, label.position);
-		var want = (occluded ? 0.3f : 1f) * (1f - Mathf.InverseLerp(40f, 90f, dist));
+		var want = (occluded ? 0.6f : 1f) * (1f - Mathf.InverseLerp(80f, 300f, dist));
 		tagAlpha = Mathf.Lerp(tagAlpha, want, 1f - Mathf.Exp(-8f * dt));
 		tag.color = new Color(TagInk.r, TagInk.g, TagInk.b, tagAlpha);
 		shade.color = new Color(0, 0, 0, ShadeInk.a * tagAlpha);
