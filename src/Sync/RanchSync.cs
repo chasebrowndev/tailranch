@@ -26,7 +26,7 @@ public static class RanchSync
 	// CollectorPull kinds.
 	const byte PullStart = 0, PullStored = 1, PullRequest = 2;
 	// StorageState kinds.
-	const byte DecorState = 0, DecorDelta = 1, DecorSelect = 2, DecorCleanup = 3, GlitchState = 4, GlitchDelta = 5;
+	const byte DecorState = 0, DecorDelta = 1, DecorSelect = 2, DecorCleanup = 3, GlitchState = 4, GlitchDelta = 5, Shortfall = 6;
 	const int GlitchMax = 300; // GlitchStorage.MAX_COUNT
 	const float AckTimeout = 2f; // client stops waiting for a SiloOp answer (host lost the silo)
 
@@ -219,8 +219,9 @@ public static class RanchSync
 		//   c→h  DecorSelect:  decorizerId string, selected int
 		//   c→h  DecorCleanup: decorizerId string, n ushort × ident int (host runs DecorizerStorage.Cleanup)
 		//   h→c  GlitchState:  storageId string, ident int, count int
-		//   c→h  GlitchDelta:  storageId string, ident int, delta int
-		Session.On(Op.StorageState, (_, r) =>
+		//   c→h  GlitchDelta:  storageId string, ident int, delta int (±1)
+		//   h→c  Shortfall:    ident int, gap int (the part of a delta the host could not apply; the client reconciles)
+		Session.On(Op.StorageState, (from, r) =>
 		{
 			var kind = r.GetByte();
 			if (!Session.InWorld) return;
@@ -244,9 +245,11 @@ public static class RanchSync
 				case DecorDelta when Session.IsHost:
 				{
 					var id = (Identifiable.Id)r.GetInt();
-					var d = r.GetInt();
-					for (var i = 0; i < d; i++) decor.Add(id);
-					for (var i = 0; i < -d && decor.GetCount(id) > 0; i++) decor.Remove(id);
+					var d = Math.Max(-1, Math.Min(1, r.GetInt()));
+					var applied = 0;
+					if (d > 0 && decor.Add(id)) applied = 1;
+					else if (d < 0 && decor.GetCount(id) > 0 && decor.Remove(id)) applied = -1;
+					SendShortfall(from, id, d - applied);
 					dirtyDecor = true;
 					break;
 				}
@@ -282,9 +285,14 @@ public static class RanchSync
 				{
 					var sid = r.GetString();
 					var id = (Identifiable.Id)r.GetInt();
-					var d = r.GetInt();
-					if (!Game.Glitch.storage.ContainsKey(sid)) return;
+					var d = Math.Max(-1, Math.Min(1, r.GetInt()));
+					if (!Game.Glitch.storage.ContainsKey(sid))
+					{
+						SendShortfall(from, id, d);
+						return;
+					}
 					var m = Game.Glitch.storage[sid];
+					var was = m.count;
 					if (d > 0 && (m.count == 0 || m.id == id))
 					{
 						m.id = id;
@@ -295,7 +303,15 @@ public static class RanchSync
 						m.count = Math.Max(0, m.count + d);
 						if (m.count == 0) m.id = Identifiable.Id.NONE;
 					}
+					SendShortfall(from, id, d - (m.count - was));
 					MarkGlitch(sid);
+					break;
+				}
+				case Shortfall when !Session.IsHost:
+				{
+					var id = (Identifiable.Id)r.GetInt();
+					var gap = r.GetInt();
+					Reconcile(id, Math.Max(-1, Math.Min(1, gap)));
 					break;
 				}
 			}
@@ -417,6 +433,17 @@ public static class RanchSync
 		w.Put((byte)Math.Min(n, 255));
 		if (Session.IsHost) Session.Broadcast(w, R);
 		else Session.SendToHost(w, R);
+	}
+
+	// Host: a client's decorizer/glitch delta only partly applied (full, wrong item, already emptied).
+	static void SendShortfall(Player to, Identifiable.Id id, int gap)
+	{
+		if (gap == 0 || to == null) return;
+		var w = Packets.Begin(Op.StorageState);
+		w.Put(Shortfall);
+		w.Put((int)id);
+		w.Put(gap);
+		Session.SendTo(to, w, R);
 	}
 
 	static void SendStorage(byte kind, Action<NetDataWriter> body)
