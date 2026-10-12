@@ -10,8 +10,8 @@ using UnityEngine.SceneManagement;
 
 namespace TailRanch.UI;
 
-// Co-op docks at the right edge beside the game's own menus (main menu, pause menu) and is never drawn
-// over play; session events surface as glass cards at top-centre. IMGUI has no blur, so depth is faked
+// Co-op docks at the left edge beside the game's own menus (main menu, pause menu), in the gap between
+// the clock and the vitals HUD, and is never drawn over play (the right side belongs to tutorial popups); session events surface as glass cards at top-centre. IMGUI has no blur, so depth is faked
 // with layered translucency, a lit hairline rim and a soft shadow.
 public class Panel : MonoBehaviour
 {
@@ -41,7 +41,7 @@ public class Panel : MonoBehaviour
 	MainMenuUI mainMenu;
 	string target, address, copyText;
 	List<string> recent;
-	GUIStyle box, card, shadow, title, label, dim, micro, microRight, ping, placeholder, tag, cardText;
+	GUIStyle box, card, shadow, title, label, dim, micro, note, microRight, ping, placeholder, tag, cardText;
 	GUIStyle button, ghost, danger, field, row, kick;
 	Texture2D panelTex, white, dotTex;
 
@@ -129,6 +129,8 @@ public class Panel : MonoBehaviour
 			if (!mainMenu && Time.unscaledTime > nextFind)
 			{
 				mainMenu = FindObjectOfType<MainMenuUI>();
+				// The message-of-the-day (a Slime Rancher 2 ad) occupies the slot the panel docks into.
+				if (mainMenu) mainMenu.transform.Find("MessageOfTheDay")?.gameObject.SetActive(false);
 				nextFind = Time.unscaledTime + 0.5f;
 			}
 			return mainMenu && mainMenu.gameObject.activeInHierarchy;
@@ -170,7 +172,7 @@ public class Panel : MonoBehaviour
 	{
 		if (vis <= 0 && cards.Count == 0) return;
 		Style();
-		var s = Mathf.Clamp(Screen.height / 1080f, 0.75f, 2.5f);
+		var s = Mathf.Clamp(Screen.height / 800f, 0.9f, 2.5f);
 		var prevMatrix = GUI.matrix;
 		var prevColor = GUI.color;
 		var prevCursor = GUI.skin.settings.cursorColor;
@@ -191,8 +193,9 @@ public class Panel : MonoBehaviour
 	void DrawPanel(float sw, float sh)
 	{
 		var e = vis * vis * (3 - 2 * vis);
-		var x = sw - Margin - Width + 18 * (1 - e);
+		var x = Margin - 18 * (1 - e);
 		var y = Mathf.Max(Margin, (sh - shownH) * 0.5f);
+		if (SceneManager.GetActiveScene().name == "MainMenu") y = Mathf.Max(y, sh * 0.36f); // below the title logo
 		var repaint = Event.current.type == EventType.Repaint;
 		GUI.color = new Color(1, 1, 1, e);
 		if (repaint) shadow.Draw(new Rect(x - Shadow, y - Shadow + 6, Width + 2 * Shadow, height + 2 * Shadow), false, false, false, false);
@@ -338,7 +341,7 @@ public class Panel : MonoBehaviour
 		GUILayout.EndHorizontal();
 	}
 
-	void PlayerRow(string name, string note, int ms, Player kickable)
+	void PlayerRow(string name, string tagText, int ms, Player kickable)
 	{
 		GUILayout.BeginHorizontal(GUILayout.Height(24));
 		GUILayout.Label(name, label);
@@ -348,7 +351,7 @@ public class Panel : MonoBehaviour
 			ping.normal.textColor = ms < 80 ? Good : ms < 160 ? Warn : Bad;
 			GUILayout.Label($"{ms} ms", ping);
 		}
-		if (note.Length > 0) GUILayout.Label(note, micro);
+		if (tagText.Length > 0) GUILayout.Label(tagText, note);
 		if (kickable != null && GUILayout.Button("×", kick, GUILayout.Width(22))) kickable.Peer?.Disconnect();
 		GUILayout.EndHorizontal();
 	}
@@ -404,8 +407,8 @@ public class Panel : MonoBehaviour
 		var w = Color.white;
 		var clear = new Color(0, 0, 0, 0);
 		var gold = new System.Func<float, Color>(a => new Color(Gold.r, Gold.g, Gold.b, a));
-		panelTex = Rounded(64, 16, new Color(0.055f, 0.06f, 0.07f, 0.6f), new Color(1, 1, 1, 0.16f), new Color(1, 1, 1, 0.05f), 18);
-		var cardTex = Rounded(48, 12, new Color(0.055f, 0.06f, 0.07f, 0.72f), new Color(1, 1, 1, 0.14f), new Color(1, 1, 1, 0.05f), 12);
+		panelTex = Rounded(64, 16, new Color(0.05f, 0.055f, 0.065f, 0.86f), new Color(1, 1, 1, 0.16f), new Color(1, 1, 1, 0.05f), 18);
+		var cardTex = Rounded(48, 12, new Color(0.05f, 0.055f, 0.065f, 0.88f), new Color(1, 1, 1, 0.14f), new Color(1, 1, 1, 0.05f), 12);
 		var shadowTex = Soft(96, 28, 14, 0.35f);
 		white = New(1, 1);
 		white.SetPixel(0, 0, w);
@@ -430,6 +433,7 @@ public class Panel : MonoBehaviour
 		label = new GUIStyle { normal = { textColor = Text }, fontSize = 12, alignment = TextAnchor.MiddleLeft, fixedHeight = 22, clipping = TextClipping.Clip };
 		dim = new GUIStyle { normal = { textColor = Dim }, fontSize = 11, wordWrap = true, margin = new RectOffset(0, 0, 2, 2) };
 		micro = new GUIStyle { normal = { textColor = Dim }, fontSize = 9, fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleLeft, margin = new RectOffset(0, 0, 4, 3) };
+		note = new GUIStyle(micro) { fixedHeight = 22, margin = new RectOffset() };
 		microRight = new GUIStyle(micro) { normal = { textColor = gold(0.8f) }, alignment = TextAnchor.MiddleRight, margin = new RectOffset() };
 		ping = new GUIStyle { fontSize = 11, fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleRight, fixedHeight = 22, margin = new RectOffset(0, 6, 0, 0) };
 		placeholder = new GUIStyle { normal = { textColor = new Color(Dim.r, Dim.g, Dim.b, 0.45f) }, fontSize = 12, alignment = TextAnchor.MiddleLeft };

@@ -15,7 +15,8 @@ public static class DevAuto
 	static float menuSince = -1f;
 	static bool hostLoadStarted, hosted, joined, menuLogged, giveUpLogged;
 	static int joinTries;
-	static float nextJoin, nextStats;
+	static float nextJoin, nextStats, pauseAt = -1f;
+	static bool paused;
 
 	static readonly long[] txCount = new long[256], txBytes = new long[256], rxCount = new long[256], rxBytes = new long[256];
 
@@ -36,6 +37,20 @@ public static class DevAuto
 		if (Plugin.DevAutoHost) AutoHost(menuReady);
 		if (Plugin.DevAutoJoin.Length > 0) AutoJoin(menuReady);
 		if (Plugin.DevStats && Time.unscaledTime >= nextStats) FlushStats();
+		if (Plugin.DevPause) AutoPause();
+	}
+
+	// Opens the pause menu once a session has a peer, so the docked panel can be screenshotted.
+	static void AutoPause()
+	{
+		if (paused || !Session.Active || !Session.InWorld || Session.Players.Count == 0) return;
+		if (pauseAt < 0f) pauseAt = Time.unscaledTime + 4f;
+		if (Time.unscaledTime < pauseAt) return;
+		var pm = SRSingleton<PauseMenu>.Instance;
+		if (!pm) return;
+		paused = true;
+		pm.PauseGame();
+		Plugin.Log.LogInfo("dev: pause menu opened");
 	}
 
 	static void AutoHost(bool menuReady)

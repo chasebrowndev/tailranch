@@ -31,6 +31,7 @@ public class Plugin : BaseUnityPlugin
 	public static readonly bool DevStats = System.Environment.GetEnvironmentVariable("TAILRANCH_STATS") == "1";
 	public static readonly string DevName = System.Environment.GetEnvironmentVariable("TAILRANCH_NAME") ?? "";
 	public static readonly bool DevLoopback = System.Environment.GetEnvironmentVariable("TAILRANCH_LOOPBACK") == "1";
+	public static readonly bool DevPause = System.Environment.GetEnvironmentVariable("TAILRANCH_PAUSE") == "1";
 
 	public static string Name => DevName.Length > 0 ? DevName : PlayerName.Value;
 
