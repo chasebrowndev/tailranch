@@ -1,6 +1,8 @@
 using System;
 using System.IO;
+using System.IO.Compression;
 using HarmonyLib;
+using MonomiPark.SlimeRancher.Persist;
 using TailRanch.Net;
 
 namespace TailRanch.Sync;
@@ -12,19 +14,41 @@ public static class RemoteSave
 	public const string Name = "tailranch_remote";
 	static byte[] pending;
 
-	public static byte[] Snapshot()
+	// Main thread. Pull builds a fresh GameV12 (SavedGame.cs:792), so the returned object
+	// stays put while the game keeps running and later saves Pull new ones.
+	public static GameV12 Pull()
 	{
 		var saved = SRSingleton<GameContext>.Instance.AutoSaveDirector.SavedGame;
 		saved.Pull(SRSingleton<SceneContext>.Instance.GameModel);
+		return saved.GameState;
+	}
+
+	// Any thread. A few lists in the pulled state still alias live models (player upgrades,
+	// gordo fashions, ammo emotions), so a concurrent change can make this throw.
+	public static byte[] Pack(GameV12 state, out int raw)
+	{
 		using var ms = new MemoryStream();
-		saved.Save(ms);
+		state.Write(ms);
+		raw = (int)ms.Length;
+		using var gz = new MemoryStream();
+		using (var z = new GZipStream(gz, CompressionMode.Compress, true))
+			z.Write(ms.GetBuffer(), 0, raw);
+		return gz.ToArray();
+	}
+
+	public static byte[] Unpack(byte[] bytes)
+	{
+		using var z = new GZipStream(new MemoryStream(bytes), CompressionMode.Decompress);
+		using var ms = new MemoryStream();
+		z.CopyTo(ms);
 		return ms.ToArray();
 	}
 
 	public static void Load(byte[] bytes, Action onLoaded, Action onError)
 	{
 		pending = bytes;
-		SceneContext.onSceneLoaded += _ => onLoaded();
+		// A failed load reverts to MainMenu without unsubscribing this, and MainMenu's SceneContext fires it.
+		SceneContext.onSceneLoaded += _ => { if (!Levels.isMainMenu()) onLoaded(); };
 		SRSingleton<GameContext>.Instance.AutoSaveDirector.BeginLoad("tailranch", Name, onError);
 	}
 
