@@ -17,7 +17,7 @@ public enum Op : byte
 	ActorSpawn,   // *    actorId long, ident int, regionSet int, pos, rot, vel
 	ActorDespawn, // *    actorId long
 	ActorMotion,  // *    count ushort, then per actor: actorId long, pos, rot, vel
-	ActorClaim,   // *    actorId long, owner byte (c→h request; h→* grant)
+	ActorClaim,   // *    actorId long, owner byte (c→h request; h→* grant, requester included)
 	ActorRelease, // *    actorId long (back to host)
 	Money,        // c→h  delta int; h→c total int
 	Keys,         // c→h  delta int; h→c total int
@@ -25,7 +25,7 @@ public enum Op : byte
 	Progress,     // *    progressType int, value int
 	PlotReplace,  // *    plotId string, plotType int
 	PlotUpgrade,  // *    plotId string, upgrade int
-	SiloState,    // *    plotId string, storageType int, then full ammo slots
+	SiloState,    // h→c  plotId string, storageType int, then full ammo slots + ack bool (RanchSync)
 	FeederSpeed,  // *    plotId string, speed int
 	GadgetPlace,  // *    siteId string, gadgetId int, yRot float
 	GadgetRemove, // *    siteId string

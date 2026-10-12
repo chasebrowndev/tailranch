@@ -2,6 +2,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Text;
 using HarmonyLib;
 using LiteNetLib;
 using LiteNetLib.Utils;
@@ -170,7 +171,7 @@ public static class WorldSync
 		//   Slot   puzzle slot id, 1 = filled                       (symmetric)
 		//   Switch master switch id, SwitchHandler.State            (symmetric)
 		//   Oasis  oasis id, 1 = live                               (symmetric)
-		//   Column fire column position key, 1 = fire activated     (symmetric)
+		//   Column fire column hierarchy key, 1 = fire activated    (symmetric)
 		//   Storm  "", FirestormActivator.Mode, endFirestormTime double, endFirecolumnsTime double, nextFirestormTime double (h→c)
 		//   Snare  gadget site id, bait Identifiable.Id, gordo Identifiable.Id int (bait symmetric; snared gordo h→c)
 		Session.On(Op.GadgetState, (from, r) =>
@@ -340,13 +341,16 @@ public static class WorldSync
 		if (!oasis.IsLive()) oasis.SetLive(false);
 	}
 
+	// Scene name, then sibling index + name per level: identical on every machine (positions can
+	// drift or collide, sibling order of static scene objects can't).
 	static string ColumnKey(FireColumn c)
 	{
-		var p = c.transform.position;
-		return $"{Mathf.RoundToInt(p.x * 10)},{Mathf.RoundToInt(p.y * 10)},{Mathf.RoundToInt(p.z * 10)}";
+		var sb = new StringBuilder();
+		for (var t = c.transform; t; t = t.parent) sb.Insert(0, $"/{t.GetSiblingIndex()}:{t.name}");
+		return c.gameObject.scene.name + sb;
 	}
 
-	// Fire columns have no persisted id; they're static scene objects, so position is stable.
+	// Fire columns have no persisted id; they're static scene objects, so their hierarchy path is stable.
 	static FireColumn FindColumn(string key)
 	{
 		if (columns.TryGetValue(key, out var c) && c != null) return c;

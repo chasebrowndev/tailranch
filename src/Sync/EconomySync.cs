@@ -35,6 +35,10 @@ public static class EconomySync
 
 	// Every acceptor ever woken, so the host can hand a client's deposit the right awarders.
 	static readonly List<ExchangeAcceptor> acceptors = new();
+	// Progress types inside AddProgress (sent as +1 deltas rather than values).
+	static readonly HashSet<ProgressDirector.ProgressType> adding = new();
+	// Client: the rancher progress SelectDailyOffer adds locally; the host adds it when it takes the offer.
+	static ProgressDirector.ProgressType? creatingFor;
 
 	// Local change worth broadcasting: not a replay, and (client) not during the world load.
 	internal static bool Live => Session.Active && !Session.Applying && (Session.IsHost || Session.InRemoteWorld);
@@ -66,17 +70,19 @@ public static class EconomySync
 			using (Session.Apply()) door.CurrState = state;
 		});
 
-		// Progress: * progressType int, value int. Counters only grow; Max stops a stale value
-		// (reordered against a concurrent change) from rolling one back.
+		// Progress: c→h progressType int, value int, add bool (add: AddProgress delta; else a SetProgress
+		// value, kept with Max since counters only grow); h→c progressType int, total int.
 		Session.On(Op.Progress, (from, r) =>
 		{
-			if (Session.IsHost) Session.Relay(from, r, RO);
 			var type = (ProgressDirector.ProgressType)r.GetInt();
 			var value = r.GetInt();
+			var add = Session.IsHost && r.GetBool();
 			if (!Session.InWorld) return;
 			var pd = Ctx.ProgressDirector;
-			if (value <= pd.GetProgress(type)) return;
-			using (Session.Apply()) pd.SetProgress(type, value);
+			var cur = pd.GetProgress(type);
+			var next = !Session.IsHost ? value : add ? cur + value : Math.Max(cur, value);
+			if (next != cur) using (Session.Apply()) pd.SetProgress(type, next);
+			if (Session.IsHost) Session.Broadcast(ProgressPacket(type), RO);
 		});
 
 		// MarketState:
@@ -107,7 +113,7 @@ public static class EconomySync
 		// Offer: offerId string, rancherId string, expireTime double, earlyExchangeTime double,
 		//   requests count byte (ident int, count int, progress int, specReward int),
 		//   rewards count byte (ident int, count int, specReward int)
-		Session.On(Op.ExchangeState, (_, r) =>
+		Session.On(Op.ExchangeState, (from, r) =>
 		{
 			var kind = (ExchangeKind)r.GetByte();
 			if (!Session.InWorld) return;
@@ -127,9 +133,16 @@ public static class EconomySync
 				case ExchangeKind.Put:
 					var offer = ReadOffer(r);
 					var w = World;
-					if (w.currOffers.ContainsKey(type)) break;
+					var rancher = type == ExchangeDirector.OfferType.GENERAL ? RancherProgress(offer.rancherId) : null;
+					if (w.currOffers.ContainsKey(type))
+					{
+						// Refused: undo the rancher progress the sender added locally.
+						if (rancher is { } rp) Session.SendTo(from, ProgressPacket(rp), RO);
+						break;
+					}
 					w.currOffers[type] = offer;
 					if (type == ExchangeDirector.OfferType.GENERAL) w.pendingOfferRancherIds.Clear();
+					if (rancher is { } p) Ctx.ProgressDirector.AddProgress(p); // not under Apply: total broadcasts
 					ed.onOfferChanged?.Invoke();
 					exchangeDirty = true;
 					break;
@@ -151,6 +164,15 @@ public static class EconomySync
 	}
 
 	enum ExchangeKind : byte { Full, Accept, Put, Clear }
+
+	static NetDataWriter ProgressPacket(ProgressDirector.ProgressType type) =>
+		Packets.Begin(Op.Progress).Also(w => { w.Put((int)type); w.Put(Ctx.ProgressDirector.GetProgress(type)); });
+
+	static ProgressDirector.ProgressType? RancherProgress(string rancherId)
+	{
+		try { return string.IsNullOrEmpty(rancherId) ? null : ProgressDirector.GetRancherProgressType(rancherId); }
+		catch (ArgumentException) { return null; }
+	}
 
 	// ---------- wallet ----------
 
@@ -407,17 +429,37 @@ public static class EconomySync
 		}
 	}
 
-	// SetProgress/SetUniqueProgress/AddProgress all funnel here.
+	[HarmonyPatch(typeof(ProgressDirector), nameof(ProgressDirector.AddProgress))]
+	static class ProgressAdd
+	{
+		static void Prefix(ProgressDirector.ProgressType type, out bool __state) => __state = adding.Add(type);
+
+		static void Finalizer(ProgressDirector.ProgressType type, bool __state)
+		{
+			if (__state) adding.Remove(type);
+		}
+	}
+
+	// SetProgress/SetUniqueProgress/AddProgress all funnel here. Host: total. Client: +1 from
+	// AddProgress (concurrent adds both count), else the value.
 	[HarmonyPatch(typeof(ProgressDirector), "NoteProgressChanged")]
 	static class ProgressChanged
 	{
 		static void Postfix(ProgressDirector __instance, ProgressDirector.ProgressType type)
 		{
 			if (!Live) return;
+			if (Session.IsHost)
+			{
+				Session.Broadcast(ProgressPacket(type), RO);
+				return;
+			}
+			if (type == creatingFor) return;
+			var add = adding.Contains(type);
 			var w = Packets.Begin(Op.Progress);
 			w.Put((int)type);
-			w.Put(__instance.GetProgress(type));
-			Session.Distribute(w, RO);
+			w.Put(add ? 1 : __instance.GetProgress(type));
+			w.Put(add);
+			Session.SendToHost(w, RO);
 		}
 	}
 
@@ -515,7 +557,8 @@ public static class EconomySync
 	}
 
 	// Client picks a daily rancher / starts a progress offer: runs locally (chat UI, rancher
-	// progress via Progress sync), then hands the created offer to the host.
+	// progress shown at once), then hands the created offer to the host, which adds the rancher
+	// progress itself only if it takes the offer.
 	[HarmonyPatch]
 	static class ExchangeCreate
 	{
@@ -525,8 +568,17 @@ public static class EconomySync
 			yield return AccessTools.Method(typeof(ExchangeDirector), nameof(ExchangeDirector.MaybeStartNext));
 		}
 
-		static void Prefix(out HashSet<ExchangeDirector.OfferType> __state) =>
+		static void Prefix(object[] __args, out HashSet<ExchangeDirector.OfferType> __state)
+		{
 			__state = ClientLive ? new HashSet<ExchangeDirector.OfferType>(World.currOffers.Keys) : null;
+			if (__state != null && __args[0] is string rancherId) creatingFor = RancherProgress(rancherId);
+		}
+
+		static Exception Finalizer(Exception __exception)
+		{
+			creatingFor = null;
+			return __exception;
+		}
 
 		static void Postfix(HashSet<ExchangeDirector.OfferType> __state)
 		{
