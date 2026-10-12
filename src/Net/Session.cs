@@ -19,6 +19,9 @@ public class Player
 	public string Name;
 	public NetPeer Peer; // host side only
 	public bool Ready;
+	// Host: reliable broadcasts that happened after this joiner's snapshot but before
+	// their world finished loading; flushed on Ready.
+	public System.Collections.Generic.List<(byte[] data, DeliveryMethod m)> Pending = new();
 }
 
 public static class Session
@@ -325,6 +328,8 @@ public static class Session
 	static void OnReady(Player p, NetPacketReader _)
 	{
 		p.Ready = true;
+		foreach (var (data, m) in p.Pending) p.Peer.Send(data, m);
+		p.Pending = null;
 		// New player learns about host + everyone else.
 		SendTo(p, JoinPacket(HostId, Plugin.PlayerName.Value), DeliveryMethod.ReliableOrdered);
 		foreach (var q in byPeer.Values.Where(q => q.Ready && q != p))
@@ -367,8 +372,12 @@ public static class Session
 	public static void Broadcast(NetDataWriter w, DeliveryMethod m, Player except = null)
 	{
 		foreach (var p in byPeer.Values)
-			if (p.Ready && p != except) Send(p.Peer, w, m);
+			if (p == except) continue;
+			else if (p.Ready) Send(p.Peer, w, m);
+			else if (Reliable(m)) p.Pending?.Add((w.CopyData(), m));
 	}
+
+	static bool Reliable(DeliveryMethod m) => m != DeliveryMethod.Unreliable && m != DeliveryMethod.Sequenced;
 
 	// Host: to all clients. Client: to host (which relays).
 	public static void Distribute(NetDataWriter w, DeliveryMethod m)
@@ -381,10 +390,17 @@ public static class Session
 	public static void Relay(Player from, NetPacketReader r, DeliveryMethod m)
 	{
 		foreach (var p in byPeer.Values)
-			if (p.Ready && p != from)
+			if (p == from) continue;
+			else if (p.Ready)
 			{
 				p.Peer.Send(r.RawData, r.UserDataOffset, r.UserDataSize, m);
 				DevAuto.Count(true, r.RawData[r.UserDataOffset], r.UserDataSize);
+			}
+			else if (Reliable(m))
+			{
+				var data = new byte[r.UserDataSize];
+				Buffer.BlockCopy(r.RawData, r.UserDataOffset, data, 0, data.Length);
+				p.Pending?.Add((data, m));
 			}
 	}
 
