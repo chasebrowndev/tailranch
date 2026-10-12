@@ -226,7 +226,7 @@ public static class Session
 				Status = "connected, requesting world";
 				var w = Packets.Begin(Op.Hello);
 				w.Put(Plugin.Version);
-				w.Put(Plugin.PlayerName.Value);
+				w.Put(Plugin.Name);
 				Send(peer, w, DeliveryMethod.ReliableOrdered);
 			}
 		};
@@ -363,7 +363,7 @@ public static class Session
 		foreach (var (data, m) in p.Pending) p.Peer.Send(data, m);
 		p.Pending = null;
 		// New player learns about host + everyone else.
-		SendTo(p, JoinPacket(HostId, Plugin.PlayerName.Value), DeliveryMethod.ReliableOrdered);
+		SendTo(p, JoinPacket(HostId, Plugin.Name), DeliveryMethod.ReliableOrdered);
 		foreach (var q in byPeer.Values.Where(q => q.Ready && q != p))
 			SendTo(p, JoinPacket(q.Id, q.Name), DeliveryMethod.ReliableOrdered);
 		Broadcast(JoinPacket(p.Id, p.Name), DeliveryMethod.ReliableOrdered, except: p);

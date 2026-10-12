@@ -10,7 +10,7 @@ public static class Tailnet
 	public static bool Allowed(IPAddress a)
 	{
 		if (a.IsIPv4MappedToIPv6) a = a.MapToIPv4();
-		if (IPAddress.IsLoopback(a)) return Plugin.AllowLoopback.Value;
+		if (IPAddress.IsLoopback(a)) return Plugin.DevLoopback || Plugin.AllowLoopback.Value;
 		var b = a.GetAddressBytes();
 		if (a.AddressFamily == AddressFamily.InterNetwork)
 			return b[0] == 100 && (b[1] & 0xC0) == 64;

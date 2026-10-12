@@ -29,6 +29,10 @@ public class Plugin : BaseUnityPlugin
 	public static readonly bool DevAutoHost = System.Environment.GetEnvironmentVariable("TAILRANCH_AUTOHOST") == "1";
 	public static readonly string DevAutoJoin = System.Environment.GetEnvironmentVariable("TAILRANCH_AUTOJOIN") ?? "";
 	public static readonly bool DevStats = System.Environment.GetEnvironmentVariable("TAILRANCH_STATS") == "1";
+	public static readonly string DevName = System.Environment.GetEnvironmentVariable("TAILRANCH_NAME") ?? "";
+	public static readonly bool DevLoopback = System.Environment.GetEnvironmentVariable("TAILRANCH_LOOPBACK") == "1";
+
+	public static string Name => DevName.Length > 0 ? DevName : PlayerName.Value;
 
 	void Awake()
 	{
@@ -39,8 +43,6 @@ public class Plugin : BaseUnityPlugin
 		PlayerName = Config.Bind("Net", "PlayerName", System.Environment.MachineName, "Name shown above your avatar");
 		JoinTarget = Config.Bind("Net", "JoinTarget", "", "Last joined tailnet host (MagicDNS name or 100.x IP)");
 		AllowLoopback = Config.Bind("Dev", "AllowLoopback", false, "Accept 127.0.0.1 peers (local two-instance testing)");
-		if (System.Environment.GetEnvironmentVariable("TAILRANCH_NAME") is { Length: > 0 } name) PlayerName.Value = name;
-		if (System.Environment.GetEnvironmentVariable("TAILRANCH_LOOPBACK") == "1") AllowLoopback.Value = true;
 
 		// Per class so one stale target logs instead of killing every other patch.
 		var harmony = new Harmony(Guid);
