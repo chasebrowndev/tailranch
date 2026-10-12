@@ -1,3 +1,4 @@
+using UnityEngine;
 using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
@@ -31,6 +32,7 @@ public class Plugin : BaseUnityPlugin
 
 	void Awake()
 	{
+		Application.runInBackground = true; // two instances on one machine: unfocused window must keep ticking
 		I = this;
 		Log = Logger;
 		Port = Config.Bind("Net", "Port", 7777, "UDP port the host listens on");
