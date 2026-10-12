@@ -19,7 +19,7 @@ namespace TailRanch.Sync;
 //   Gadget         c→h  gadgetId int, delta int; h→c gadgetId int, total int
 //   Pedia          *    count ushort, then pediaId int each
 //   Map            *    zone int
-//   Mail           c→h  type byte, key string (request); h→c same (host sent it)
+//   Mail           c→h  type byte, key string (request); h→c same (host sent it, or the requester's answer when it already had it)
 // "*": the acting machine applies locally, host relays, receivers replay under Apply.
 // Currency for purchases rides EconomySync; refinery spending rides RanchSync.
 // Avail sets change inside PlayerState/GadgetDirector.Update loops, so Tick diffs them and
@@ -49,7 +49,7 @@ public static class ProfileSync
 		{
 			var kind = (Kind)r.GetByte();
 			if (kind == Kind.Gadget) { OnGadget(r); return; }
-			if (kind == Kind.Mail) { OnMail(r); return; }
+			if (kind == Kind.Mail) { OnMail(from, r); return; }
 			if (Session.IsHost) Session.Relay(from, r, R);
 			if (!Session.InWorld) return;
 			Seen();
@@ -237,13 +237,17 @@ public static class ProfileSync
 		return w;
 	}
 
-	static void OnMail(NetPacketReader r)
+	static void OnMail(Player from, NetPacketReader r)
 	{
 		var type = (MailDirector.Type)r.GetByte();
 		var key = r.GetString();
 		if (!Session.InWorld) return;
 		// Host: a client's tracker fired (e.g. it read the prerequisite mail); send for real, postfix broadcasts.
-		if (Session.IsHost) Ctx.MailDirector.SendMail(type, key);
+		// Refused (host already has it): the requester still gets it, so its tracker stops asking.
+		if (Session.IsHost)
+		{
+			if (!Ctx.MailDirector.SendMail(type, key)) Session.SendTo(from, MailPacket(type, key), R);
+		}
 		else using (Session.Apply()) Ctx.MailDirector.SendMail(type, key);
 	}
 

@@ -18,7 +18,7 @@ namespace TailRanch.Sync;
 // Client ids are (LocalId << 48) | n so they never collide with host ids.
 public static class ActorSync
 {
-	const float MotionInterval = 0.1f, ReleaseAfter = 3f;
+	const float MotionInterval = 0.1f, ReleaseAfter = 3f, ClaimWait = 1.5f;
 	const int PerPacket = 22; // 3 + 22 * 48 bytes
 	const long Block = 1L << 48;
 	const DeliveryMethod RO = DeliveryMethod.ReliableOrdered;
@@ -35,6 +35,8 @@ public static class ActorSync
 	static readonly List<(long id, Vector3 pos, Quaternion rot, Vector3 vel)> relay = new();
 	static readonly Dictionary<long, (Vector3 pos, Quaternion rot)> lastSent = new();
 	static readonly Dictionary<long, float> restSince = new();
+	// Client: claims sent, host's grant/deny not back yet. Vacced items wait on these before turning into ammo.
+	static readonly HashSet<long> awaiting = new();
 	static readonly List<GameObject> loadStrays = new();
 	static readonly HashSet<Identifiable.Id> logged = new();
 	static readonly List<long> batch = new(), dead = new(), release = new();
@@ -190,9 +192,13 @@ public static class ActorSync
 				lastSent.Remove(id);
 				ActorPuppet.Set(go, true, true);
 				Session.Broadcast(Claim(id, from.Id), RO, from);
+				Session.SendTo(from, Claim(id, from.Id), RO); // grant: the requester may consume it now
 				return;
 			}
 			if (!Enter()) return;
+			awaiting.Remove(id);
+			// Our own grant: Grab already took it (or we've since released it; the host saw that after).
+			if (o == Session.LocalId) return;
 			var mine = Owns(id);
 			if (o == Session.HostId) owner.Remove(id);
 			else owner[id] = o;
@@ -210,6 +216,7 @@ public static class ActorSync
 			var id = r.GetLong();
 			var o = r.GetByte();
 			if (Session.IsHost || !Enter() || o == Session.LocalId) return;
+			awaiting.Remove(id);
 			restSince.Remove(id);
 			lastSent.Remove(id);
 			if (o == Unknown)
@@ -239,6 +246,7 @@ public static class ActorSync
 			if (!Enter()) return;
 			var mine = Owns(id);
 			owner.Remove(id);
+			awaiting.Remove(id);
 			restSince.Remove(id);
 			if (!objs.TryGetValue(id, out var g) || !g) return;
 			if (mine) Revoke(g);
@@ -545,6 +553,7 @@ public static class ActorSync
 			SendMotion(batch, w => Session.SendToHost(w, RO));
 			Session.SendToHost(Release(id), RO);
 			owner.Remove(id);
+			awaiting.Remove(id);
 			restSince.Remove(id);
 			ActorPuppet.Set(objs[id], true, true);
 		}
@@ -583,6 +592,7 @@ public static class ActorSync
 		objs.Remove(id);
 		regionOf.Remove(id);
 		owner.Remove(id);
+		awaiting.Remove(id);
 		lastSent.Remove(id);
 		restSince.Remove(id);
 		pendingState.Remove(id);
@@ -600,6 +610,7 @@ public static class ActorSync
 		foreach (var go in objs.Values)
 			if (go && go.GetComponent<ActorPuppet>()) ActorPuppet.Set(go, false, false);
 		owner.Clear();
+		awaiting.Clear();
 		pendingSpawns.Clear();
 		pendingDespawns.Clear();
 		pendingState.Clear();
@@ -682,6 +693,7 @@ public static class ActorSync
 		{
 			if (!entered) return;
 			owner[id] = Session.LocalId;
+			awaiting.Add(id);
 			restSince.Remove(id);
 			lastSent.Remove(id);
 			ActorPuppet.Set(go, false, true);
@@ -784,15 +796,37 @@ public static class ActorSync
 		}
 	}
 
-	// A denied/revoked actor still animating into the vac must not turn into ammo.
+	static bool Awaiting(GameObject go) => go && idOf.TryGetValue(go, out var id) && awaiting.Contains(id);
+
+	// A denied/revoked actor still animating into the vac must not turn into ammo, nor one whose
+	// claim is unanswered (the host may refuse it and respawn it: a duplicate).
 	[HarmonyPatch(typeof(Vacuumable), nameof(Vacuumable.TryConsume))]
 	static class OnConsume
 	{
 		static bool Prefix(Vacuumable __instance, ref bool __result)
 		{
-			if (Session.Applying || !IsRemoteOwned(__instance.gameObject)) return true;
+			if (Session.Applying || !IsRemoteOwned(__instance.gameObject) && !Awaiting(__instance.gameObject)) return true;
 			__result = false;
 			return false;
+		}
+	}
+
+	// Client: hold the item at the nozzle (MoveTowards stays on) until the host answers the claim.
+	[HarmonyPatch(typeof(WeaponVacuum), "StartConsuming")]
+	static class ConsumeAwaitsClaim
+	{
+		static void Postfix(Vacuumable vacuumable, ref IEnumerator __result)
+		{
+			if (Session.IsClient) __result = AwaitClaim(__result, vacuumable);
+		}
+
+		static IEnumerator AwaitClaim(IEnumerator inner, Vacuumable vac)
+		{
+			if (!inner.MoveNext()) yield break;
+			yield return inner.Current;
+			var until = Time.time + ClaimWait;
+			while (vac && Awaiting(vac.gameObject) && Time.time < until) yield return null;
+			while (inner.MoveNext()) yield return inner.Current;
 		}
 	}
 

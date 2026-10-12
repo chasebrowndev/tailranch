@@ -28,6 +28,7 @@ public static class RanchSync
 	// StorageState kinds.
 	const byte DecorState = 0, DecorDelta = 1, DecorSelect = 2, DecorCleanup = 3, GlitchState = 4, GlitchDelta = 5;
 	const int GlitchMax = 300; // GlitchStorage.MAX_COUNT
+	const float AckTimeout = 2f; // client stops waiting for a SiloOp answer (host lost the silo)
 
 	static readonly AccessTools.FieldRef<LandPlotModel, GameObject> plotObj = AccessTools.FieldRefAccess<LandPlotModel, GameObject>("gameObj");
 	static readonly AccessTools.FieldRef<Ammo, AmmoModel> ammoModel = AccessTools.FieldRefAccess<Ammo, AmmoModel>("ammoModel");
@@ -46,6 +47,8 @@ public static class RanchSync
 	// Client: contents before the first unsent local change (diffed into SiloOps), and ash deltas.
 	static readonly Dictionary<Ammo, (Identifiable.Id id, int n)[]> baseline = new();
 	static readonly Dictionary<FillableAshSource, float> ashDelta = new();
+	// Client: SiloOps sent per silo and not yet answered (count, last send time).
+	static readonly Dictionary<Ammo, (int n, float at)> inFlight = new();
 	static readonly HashSet<Gadget> dirtyGadgets = new();
 
 	static GameModel Game => SRSingleton<SceneContext>.Instance.GameModel;
@@ -86,7 +89,8 @@ public static class RanchSync
 		});
 
 		// h→c  storageId string (plotId, or siteId for warp depots), storageType int, then
-		//      ash: units float | ammo: n byte × (ident int, [count int, emo byte × (emotion byte, value float)])
+		//      ash: units float | ammo: n byte × (ident int, [count int, emo byte × (emotion byte, value float)]), ack bool
+		// ack: the host's answer to one of this client's SiloOps (sent to the requester only).
 		Session.On(Op.SiloState, (_, r) =>
 		{
 			var id = r.GetString();
@@ -103,14 +107,24 @@ public static class RanchSync
 				return;
 			}
 			var data = ReadAmmo(r);
+			var ack = r.GetBool();
 			var ammo = FindSilo(id, type)?.LocalAmmo;
 			if (Slots(ammo) == null) return;
+			if (ack && inFlight.TryGetValue(ammo, out var f))
+			{
+				if (f.n <= 1) inFlight.Remove(ammo);
+				else inFlight[ammo] = (f.n - 1, f.at);
+			}
 			// Unsent local edits are diffed against the pre-edit contents; send them before overwriting.
 			if (baseline.TryGetValue(ammo, out var before))
 			{
 				SendOps(ammo, before);
 				baseline.Remove(ammo);
 			}
+			// Older than ops still in flight: it would resurrect what we took out (dup) or drop what we
+			// put in. Their ack carries newer contents.
+			if (inFlight.TryGetValue(ammo, out f) && Time.time - f.at < AckTimeout) return;
+			inFlight.Remove(ammo);
 			using (Session.Apply())
 			{
 				ammo.Clear();
@@ -120,8 +134,9 @@ public static class RanchSync
 
 		// c→h  storageId string, storageType int, then
 		//      ash: delta float | ammo: n byte × (slot byte, ident int, delta int)
-		// Host applies what still fits and always answers with SiloState (corrects the sender too).
-		Session.On(Op.SiloOp, (_, r) =>
+		// Host applies what still fits and answers the sender with an ack SiloState (its corrected
+		// contents, rejected parts included), then broadcasts the change.
+		Session.On(Op.SiloOp, (from, r) =>
 		{
 			var id = r.GetString();
 			var type = r.GetInt();
@@ -143,6 +158,7 @@ public static class RanchSync
 			var s = FindSilo(id, type);
 			if (s == null || Slots(s.LocalAmmo) == null) return;
 			foreach (var op in ops) ApplyOp(s.LocalAmmo, op.slot, op.id, op.delta);
+			Session.SendTo(from, SiloPacket(s, true), R);
 			MarkSilo(s);
 		});
 
@@ -445,6 +461,7 @@ public static class RanchSync
 			dirtyGlitch.Clear();
 			dirtyDecor = false;
 			baseline.Clear();
+			inFlight.Clear();
 			ashDelta.Clear();
 			dirtyGadgets.Clear();
 			return;
@@ -471,11 +488,7 @@ public static class RanchSync
 		{
 			var id = s ? StorageId(s) : null;
 			if (id == null || Slots(s.LocalAmmo) == null) continue;
-			var w = Packets.Begin(Op.SiloState);
-			w.Put(id);
-			w.Put((int)s.type);
-			WriteAmmo(w, s.LocalAmmo);
-			Session.Broadcast(w, R);
+			Session.Broadcast(SiloPacket(s, false), R);
 		}
 		dirtySilos.Clear();
 		foreach (var a in dirtyAsh)
@@ -524,6 +537,16 @@ public static class RanchSync
 			});
 		}
 		dirtyGlitch.Clear();
+	}
+
+	static NetDataWriter SiloPacket(SiloStorage s, bool ack)
+	{
+		var w = Packets.Begin(Op.SiloState);
+		w.Put(StorageId(s));
+		w.Put((int)s.type);
+		WriteAmmo(w, s.LocalAmmo);
+		w.Put(ack);
+		return w;
 	}
 
 	static void FlushClient()
@@ -588,6 +611,7 @@ public static class RanchSync
 			w.Put(op.delta);
 		}
 		Session.SendToHost(w, R);
+		inFlight[ammo] = ((inFlight.TryGetValue(ammo, out var f) ? f.n : 0) + 1, Time.time);
 	}
 
 	// Host: apply one client delta. Adds overflow rather than lose an item the client already
