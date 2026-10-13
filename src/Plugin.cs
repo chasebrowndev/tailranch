@@ -15,7 +15,7 @@ namespace TailRanch;
 public class Plugin : BaseUnityPlugin
 {
 	public const string Guid = "dev.chasebrown.tailranch";
-	public const string Version = "0.3.2";
+	public const string Version = "0.3.3";
 	static int failedHooks;
 	// The menu's version label (Application.version says 1.4.3 on 1.4.4). Needs GameContext, so only valid from the menu on.
 	public static string GameBuild => SRSingleton<GameContext>.Instance ? SRSingleton<GameContext>.Instance.MessageDirector.Get("build", "m.version") : "?";

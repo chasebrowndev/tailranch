@@ -365,26 +365,24 @@ public static class RanchSync
 			else counts[id] = v;
 		});
 
-		// c→h  gadgetId int: the client fabricated it locally. The host spends the costs from the shared
+		// c→h  gadgetId int: the client wants to fabricate. The host spends the costs from the shared
 		//      refinery (its own definition, never the client's numbers).
-		// h→c  gadgetId int: the refinery couldn't cover it; the client takes the crafted gadget(s) back.
+		// h→c  gadgetId int, ok bool: the client crafts only now, so a gadget never exists before it's paid for.
 		Session.On(Op.Craft, (from, r) =>
 		{
 			var id = (Gadget.Id)r.GetInt();
 			if (!Session.InWorld) return;
-			var ctx = SRSingleton<SceneContext>.Instance;
+			if (!Session.IsHost)
+			{
+				Fabricator.Answer(id, r.GetBool());
+				return;
+			}
 			GadgetDefinition def;
 			try { def = SRSingleton<GameContext>.Instance.LookupDirector.GetGadgetDefinition(id); }
 			catch (KeyNotFoundException) { return; }
-			if (Session.IsHost)
-			{
-				if (ctx.GadgetDirector.TryToSpendFromRefinery(def.craftCosts)) return; // the spend postfix broadcasts the totals
-				Session.SendTo(from, Packets.Begin(Op.Craft).Also(w => w.Put((int)id)), R);
-				foreach (var c in def.craftCosts) SendRefinery(c.id, 0); // resync the requester's mirror
-				return;
-			}
-			// Not under Apply: the gadget-count deltas must reach the host to cancel the craft's.
-			for (var i = def.buyInPairs ? 2 : 1; i > 0; i--) ctx.GadgetDirector.RemoveGadget(id);
+			var ok = SRSingleton<SceneContext>.Instance.GadgetDirector.TryToSpendFromRefinery(def.craftCosts); // the spend postfix broadcasts the totals
+			Session.SendTo(from, Packets.Begin(Op.Craft).Also(w => { w.Put((int)id); w.Put(ok); }), R);
+			if (!ok) foreach (var c in def.craftCosts) SendRefinery(c.id, 0); // resync the requester's mirror
 		});
 	}
 
@@ -1072,32 +1070,57 @@ public static class RanchSync
 		}
 	}
 
-	// Client: which gadget the fabricator is crafting, so the spend goes to the host as one craft it can refuse.
-	static Gadget.Id crafting = Gadget.Id.NONE;
-
+	// Client: Fabricate asks the host first and reruns with its verdict standing in for the refinery spend.
 	[HarmonyPatch(typeof(FabricateGadgetUI), nameof(FabricateGadgetUI.Fabricate))]
-	static class FabricateScope
+	static class Fabricator
 	{
-		static void Prefix(Gadget.Id id) => crafting = id;
+		internal static bool? verdict;
+		static FabricateGadgetUI ui;
+		static float askedAt = -10;
 
-		static Exception Finalizer(Exception __exception)
+		static bool Prefix(FabricateGadgetUI __instance, Gadget.Id id)
 		{
-			crafting = Gadget.Id.NONE;
-			return __exception;
+			if (!Live || !Session.IsClient || verdict != null) return true;
+			var gd = SRSingleton<SceneContext>.Instance.GadgetDirector;
+			if (!gd.CanAddGadget(SRSingleton<GameContext>.Instance.LookupDirector.GetGadgetDefinition(id))) return true; // the game shows its own error
+			if (Time.unscaledTime - askedAt < 5f) return false; // one craft in flight
+			askedAt = Time.unscaledTime;
+			ui = __instance;
+			Session.SendToHost(Packets.Begin(Op.Craft).Also(w => w.Put((int)id)), R);
+			return false;
+		}
+
+		internal static void Answer(Gadget.Id id, bool ok)
+		{
+			askedAt = -10;
+			// Not under Apply: the gadget-count deltas must reach the host.
+			if (!ui)
+			{
+				if (!ok) return;
+				var gd = SRSingleton<SceneContext>.Instance.GadgetDirector;
+				gd.AddGadget(id);
+				if (SRSingleton<GameContext>.Instance.LookupDirector.GetGadgetDefinition(id).buyInPairs) gd.AddGadget(id);
+				return;
+			}
+			verdict = ok;
+			try { ui.Fabricate(id); } // purchase or "insufficient resources" cue, FX, rebuild
+			finally { verdict = null; }
 		}
 	}
 
 	[HarmonyPatch(typeof(GadgetDirector), nameof(GadgetDirector.TryToSpendFromRefinery))]
 	static class RefinerySpend
 	{
+		static bool Prefix(ref bool __result)
+		{
+			if (Fabricator.verdict == null) return true;
+			__result = Fabricator.verdict.Value; // the host already spent
+			return false;
+		}
+
 		static void Postfix(GadgetDefinition.CraftCost[] costs, bool __result)
 		{
-			if (!Live || !__result) return;
-			if (Session.IsClient && crafting != Gadget.Id.NONE)
-			{
-				Session.SendToHost(Packets.Begin(Op.Craft).Also(w => w.Put((int)crafting)), R);
-				return;
-			}
+			if (!Live || !__result || Fabricator.verdict != null) return;
 			foreach (var c in costs)
 				if (c.amount > 0) SendRefinery(c.id, -c.amount);
 		}
