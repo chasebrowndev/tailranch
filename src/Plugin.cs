@@ -15,7 +15,7 @@ namespace TailRanch;
 public class Plugin : BaseUnityPlugin
 {
 	public const string Guid = "dev.chasebrown.tailranch";
-	public const string Version = "0.3.3";
+	public const string Version = "0.4.0";
 	static int failedHooks;
 	// The menu's version label (Application.version says 1.4.3 on 1.4.4). Needs GameContext, so only valid from the menu on.
 	public static string GameBuild => SRSingleton<GameContext>.Instance ? SRSingleton<GameContext>.Instance.MessageDirector.Get("build", "m.version") : "?";
@@ -31,6 +31,8 @@ public class Plugin : BaseUnityPlugin
 	public static ConfigEntry<string> PlayerName;
 	public static ConfigEntry<string> JoinTarget;
 	public static ConfigEntry<bool> AllowLoopback;
+	public static ConfigEntry<string> PlayerId, Password, JoinPassword;
+	public static ConfigEntry<bool> ShareMoney, ShareUpgrades, ShareBlueprints, ShareProgress;
 
 	// Dev harness (scripts/sr.sh), env-only so they never persist into the config.
 	public static readonly bool DevAutoHost = System.Environment.GetEnvironmentVariable("TAILRANCH_AUTOHOST") == "1";
@@ -47,6 +49,8 @@ public class Plugin : BaseUnityPlugin
 	public static readonly bool DevPingDemo = System.Environment.GetEnvironmentVariable("TAILRANCH_PINGDEMO") == "1";
 	// Each instance chats on a loop over the real network path; the client also opens its composer with a draft.
 	public static readonly bool DevChatDemo = System.Environment.GetEnvironmentVariable("TAILRANCH_CHATDEMO") == "1";
+	// The host's panel opens on its manage view.
+	public static readonly bool DevManage = System.Environment.GetEnvironmentVariable("TAILRANCH_MANAGE") == "1";
 
 	public static string Name => DevName.Length > 0 ? DevName : PlayerName.Value.Trim().Length > 0 ? PlayerName.Value.Trim() : System.Environment.MachineName;
 
@@ -58,6 +62,14 @@ public class Plugin : BaseUnityPlugin
 		Port = Config.Bind("Net", "Port", 7777, "UDP port the host listens on");
 		PlayerName = Config.Bind("Net", "PlayerName", System.Environment.MachineName, "Name shown above your avatar");
 		JoinTarget = Config.Bind("Net", "JoinTarget", "", "Last joined tailnet host (MagicDNS name or 100.x IP)");
+		PlayerId = Config.Bind("Net", "PlayerId", "", "Stable id the host keys your unshared progress by (generated; keep it to keep your progress)");
+		if (PlayerId.Value.Length == 0) PlayerId.Value = System.Guid.NewGuid().ToString("N");
+		Password = Config.Bind("Net", "Password", "", "Host: password joiners must give (empty = open)");
+		JoinPassword = Config.Bind("Net", "JoinPassword", "", "Password sent when joining");
+		ShareMoney = Config.Bind("Share", "Money", true, "Host: one wallet and key count for everyone (off: per player)");
+		ShareUpgrades = Config.Bind("Share", "Upgrades", true, "Host: personal upgrades shared (off: per player)");
+		ShareBlueprints = Config.Bind("Share", "Blueprints", true, "Host: blueprints and gadget stock shared (off: per player)");
+		ShareProgress = Config.Bind("Share", "Progress", true, "Host: slimepedia, map and mail shared (off: per player)");
 		AllowLoopback = Config.Bind("Dev", "AllowLoopback", false, "Accept 127.0.0.1 peers (local two-instance testing)");
 
 		// Per class so one stale target logs instead of killing every other patch.
@@ -96,6 +108,7 @@ public class Plugin : BaseUnityPlugin
 		("WorldSync", WorldSync.Tick),
 		("PresenceSync", PresenceSync.Tick),
 		("ProfileSync", ProfileSync.Tick),
+		("Profiles", Profiles.Tick),
 	};
 	static readonly string[] lastError = new string[ticks.Length];
 

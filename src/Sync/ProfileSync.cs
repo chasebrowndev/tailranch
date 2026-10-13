@@ -25,6 +25,7 @@ namespace TailRanch.Sync;
 // Avail sets change inside PlayerState/GadgetDirector.Update loops, so Tick diffs them and
 // both sides union (client-local unlock conditions like fabricated count / read mail count too).
 // Mail is host-only: clients never add mail themselves; they forward and take the host's.
+// A kind the host doesn't share (Share) is neither sent nor replayed; Profiles keeps it per player.
 public static class ProfileSync
 {
 	enum Kind : byte { Upgrade, AvailUpgrade, Blueprint, AvailBlueprint, Gadget, Pedia, Map, Mail }
@@ -48,6 +49,7 @@ public static class ProfileSync
 		Session.On(Op.Profile, (from, r) =>
 		{
 			var kind = (Kind)r.GetByte();
+			if (!IsShared(kind)) return;
 			if (kind == Kind.Gadget) { OnGadget(r); return; }
 			if (kind == Kind.Mail) { OnMail(from, r); return; }
 			if (Session.IsHost) Session.Relay(from, r, R);
@@ -56,6 +58,13 @@ public static class ProfileSync
 			using (Session.Apply()) Replay(kind, r);
 		});
 	}
+
+	static bool IsShared(Kind k) => k switch
+	{
+		Kind.Upgrade or Kind.AvailUpgrade => Share.Upgrades,
+		Kind.Blueprint or Kind.AvailBlueprint or Kind.Gadget => Share.Blueprints,
+		_ => Share.Progress,
+	};
 
 	public static void Tick()
 	{
@@ -112,7 +121,7 @@ public static class ProfileSync
 				if (ctx.PlayerState.HasUpgrade(u)) return;
 				// The buyer's SPARE_KEY key went through PlayerModel.AddKey, invisible to EconomySync:
 				// the host grants its own copy (matching the buyer) and pushes the total.
-				var key = Session.IsHost && u == PlayerState.Upgrade.SPARE_KEY;
+				var key = Session.IsHost && u == PlayerState.Upgrade.SPARE_KEY && Share.Money;
 				ctx.PlayerState.AddUpgrade(u, key);
 				if (key) BroadcastKeys();
 				return;
@@ -171,6 +180,7 @@ public static class ProfileSync
 
 	static void Send(Kind k, int v)
 	{
+		if (!IsShared(k)) return;
 		var w = Begin(k);
 		w.Put(v);
 		Session.Distribute(w, R);
@@ -196,6 +206,7 @@ public static class ProfileSync
 	// Client: delta to host. Host: current total to everyone.
 	static void SendGadget(Gadget.Id id, int delta)
 	{
+		if (!Share.Blueprints) return;
 		var w = Begin(Kind.Gadget);
 		w.Put((int)id);
 		if (Session.IsHost)
@@ -257,7 +268,7 @@ public static class ProfileSync
 	{
 		static bool Prefix(MailDirector.Type type, string key, ref bool __result)
 		{
-			if (!Session.IsClient || Session.Applying) return true;
+			if (!Session.IsClient || Session.Applying || !Share.Progress) return true;
 			if (Session.InRemoteWorld && !Ctx.GameModel.GetMailModel().allMailDict.ContainsKey(new MailDirector.Mail(type, key)))
 				Session.SendToHost(MailPacket(type, key), R);
 			__result = false;
@@ -266,7 +277,7 @@ public static class ProfileSync
 
 		static void Postfix(MailDirector.Type type, string key, bool __result)
 		{
-			if (__result && Session.IsHost && !Session.Applying) Session.Broadcast(MailPacket(type, key), R);
+			if (__result && Session.IsHost && !Session.Applying && Share.Progress) Session.Broadcast(MailPacket(type, key), R);
 		}
 	}
 
@@ -281,7 +292,7 @@ public static class ProfileSync
 		{
 			if (__state || !Live) return;
 			Send(Kind.Upgrade, (int)upgrade);
-			if (Session.IsHost && isFirstTime && upgrade == PlayerState.Upgrade.SPARE_KEY) BroadcastKeys();
+			if (Session.IsHost && isFirstTime && upgrade == PlayerState.Upgrade.SPARE_KEY && Share.Money && Share.Upgrades) BroadcastKeys();
 		}
 	}
 
@@ -303,7 +314,7 @@ public static class ProfileSync
 
 		static void Postfix(PediaDirector.Id[] __state)
 		{
-			if (__state == null || __state.Length == 0) return;
+			if (__state == null || __state.Length == 0 || !Share.Progress) return;
 			var w = Begin(Kind.Pedia);
 			w.Put((ushort)__state.Length);
 			foreach (var id in __state) w.Put((int)id);

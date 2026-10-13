@@ -30,9 +30,14 @@ public static class RemoteSave
 		using var ms = new MemoryStream();
 		state.Write(ms);
 		raw = (int)ms.Length;
+		return Gzip(ms);
+	}
+
+	public static byte[] Gzip(MemoryStream ms)
+	{
 		using var gz = new MemoryStream();
 		using (var z = new GZipStream(gz, CompressionMode.Compress, true))
-			z.Write(ms.GetBuffer(), 0, raw);
+			z.Write(ms.GetBuffer(), 0, (int)ms.Length);
 		return gz.ToArray();
 	}
 

@@ -17,6 +17,7 @@ public class Player
 {
 	public byte Id;
 	public string Name;
+	public string Uid; // host side only: stable id from Hello (Profiles, bans)
 	public NetPeer Peer; // host side only
 	public bool Ready;
 	public float RenamedAt = -1; // host: rename rate limit
@@ -45,6 +46,14 @@ public static class Session
 
 	// Remote players by id (never contains the local player).
 	public static readonly Dictionary<byte, Player> Players = new();
+
+	// Host: refused until hosting stops.
+	public class Ban
+	{
+		public string Uid, Name;
+		public System.Net.IPAddress Ip;
+	}
+	public static readonly List<Ban> Bans = new();
 
 	static NetManager net;
 	static NetPeer hostPeer;
@@ -80,7 +89,12 @@ public static class Session
 	static Session()
 	{
 		On(Op.Hello, OnHello);
-		On(Op.Welcome, (_, r) => { if (IsClient) LocalId = r.GetByte(); });
+		On(Op.Welcome, (_, r) =>
+		{
+			if (!IsClient) return;
+			LocalId = r.GetByte();
+			Share.Remote = (Shared)r.GetByte();
+		});
 		On(Op.World, OnWorld);
 		On(Op.Ready, OnReady);
 		On(Op.PlayerJoin, (_, r) => { if (IsClient) AddPlayer(r.GetByte(), r.GetString()); });
@@ -96,6 +110,7 @@ public static class Session
 		Register("WorldSync", WorldSync.Register);
 		Register("PresenceSync", PresenceSync.Register);
 		Register("ProfileSync", ProfileSync.Register);
+		Register("Profiles", Profiles.Register);
 		Register("Chat", UI.Chat.Register);
 	}
 
@@ -117,6 +132,11 @@ public static class Session
 			{
 				Plugin.Log.LogWarning($"rejected non-tailnet peer {req.RemoteEndPoint}");
 				req.Reject();
+				return;
+			}
+			if (Bans.Any(b => b.Ip.Equals(req.RemoteEndPoint.Address)))
+			{
+				req.Reject(new NetDataWriter().Also(w => w.Put("banned by host")));
 				return;
 			}
 			req.AcceptIfKey(Key);
@@ -179,6 +199,8 @@ public static class Session
 			catch (Exception e) { Plugin.Log.LogError($"despawn {id}: {e}"); }
 		}
 		Players.Clear();
+		Bans.Clear();
+		Share.Remote = Shared.All;
 		Status = why;
 		Plugin.Log.LogInfo($"session stopped: {why}");
 	}
@@ -231,6 +253,8 @@ public static class Session
 				w.Put(Plugin.Version);
 				w.Put(Plugin.Name);
 				w.Put(Plugin.GameBuild);
+				w.Put(Plugin.PlayerId.Value);
+				w.Put(Plugin.JoinPassword.Value);
 				Send(peer, w, DeliveryMethod.ReliableOrdered);
 			}
 		};
@@ -282,28 +306,42 @@ public static class Session
 		var name = r.GetString();
 		if (ver != Plugin.Version)
 		{
-			var w = new NetDataWriter();
-			w.Put($"version mismatch: host {Plugin.Version}, you {ver}");
-			p.Peer.Disconnect(w);
+			Refuse(p.Peer, $"version mismatch: host {Plugin.Version}, you {ver}");
 			return;
 		}
 		var game = r.GetString();
 		if (game != Plugin.GameBuild)
 		{
-			var w = new NetDataWriter();
-			w.Put($"game version mismatch: host {Plugin.GameBuild}, you {game}");
-			p.Peer.Disconnect(w);
+			Refuse(p.Peer, $"game version mismatch: host {Plugin.GameBuild}, you {game}");
 			return;
 		}
+		var uid = r.GetString(64);
+		var pass = r.GetString();
+		if (Plugin.Password.Value.Length > 0 && pass != Plugin.Password.Value)
+		{
+			Refuse(p.Peer, "wrong password");
+			return;
+		}
+		if (uid.Length == 0 || Bans.Any(b => b.Uid == uid))
+		{
+			Refuse(p.Peer, "banned by host");
+			return;
+		}
+		if (uid == Plugin.PlayerId.Value || byPeer.Values.Any(x => x.Uid == uid))
+		{
+			Refuse(p.Peer, "already connected (same Net.PlayerId)");
+			return;
+		}
+		p.Uid = uid;
 		byte id = 1;
 		while (byPeer.Values.Any(x => x.Id == id)) id++;
 		p.Id = id;
 		p.Name = name;
 		byPeer[p.Peer] = p;
 
-		SendTo(p, Packets.Begin(Op.Welcome).Also(w => w.Put(id)), DeliveryMethod.ReliableOrdered);
+		SendTo(p, Packets.Begin(Op.Welcome).Also(w => { w.Put(id); w.Put((byte)Share.Flags); }), DeliveryMethod.ReliableOrdered);
 		// Pull reads live transforms so it stays here; serialize + gzip on the ThreadPool.
-		var state = RemoteSave.Pull();
+		var state = Profiles.Apply(RemoteSave.Pull(), uid);
 		PlayerHello?.Invoke(p);
 		Plugin.Log.LogInfo($"{name} joined as {id}, packing world");
 		ThreadPool.QueueUserWorkItem(_ =>
@@ -324,6 +362,16 @@ public static class Session
 				});
 			}
 		});
+	}
+
+	static void Refuse(NetPeer peer, string why) => peer.Disconnect(new NetDataWriter().Also(w => w.Put(why)));
+
+	// Host: drop a player with a reason their panel shows; a ban also refuses their id and address until hosting stops.
+	public static void Kick(Player p, bool ban)
+	{
+		if (!IsHost || p.Peer == null) return;
+		if (ban) Bans.Add(new Ban { Uid = p.Uid, Name = p.Name, Ip = p.Peer.Address });
+		Refuse(p.Peer, ban ? "banned by host" : "kicked by host");
 	}
 
 	static void SendWorld(Player p, byte[] gz, int raw)

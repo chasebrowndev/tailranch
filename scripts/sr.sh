@@ -4,7 +4,7 @@
 #   sr.sh b      client instance (auto-joins A)
 #   sr.sh both   both, B after a delay
 #   sr.sh logs   tail both BepInEx logs
-# Env: TARGET (join target for B, default 127.0.0.1), NOAUTO=1 to skip auto host/join.
+# Env: TARGET (join target for B, default 127.0.0.1), NOAUTO=1 to skip auto host/join, W/H window size (1280x720).
 set -euo pipefail
 
 GAME_A="${GAME_DIR:-$HOME/Downloads/slimerancher/Slime Rancher v1.4.4}"
@@ -41,7 +41,7 @@ launch() { # name dir env...
 			STEAM_COMPAT_DATA_PATH="$STATE/pfx-$name" \
 			WINEDLLOVERRIDES="winhttp=n,b" \
 			TAILRANCH_LOOPBACK=1 TAILRANCH_STATS=1 "$@" \
-			"$PROTON" run "$dir/SlimeRancher.exe" -screen-fullscreen 0 -screen-width 1280 -screen-height 720 \
+			"$PROTON" run "$dir/SlimeRancher.exe" -screen-fullscreen 0 -screen-width "${W:-1280}" -screen-height "${H:-720}" \
 			>"$STATE/proton-$name.log" 2>&1 &
 	)
 	echo "launched $name (proton log: $STATE/proton-$name.log, bepinex log: $dir/BepInEx/LogOutput.log)"

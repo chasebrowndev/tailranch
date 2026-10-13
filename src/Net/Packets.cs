@@ -5,8 +5,8 @@ namespace TailRanch.Net;
 
 public enum Op : byte
 {
-	Hello,       // c→h  version, name
-	Welcome,     // h→c  your id
+	Hello,       // c→h  version, name, game build, player id, password
+	Welcome,     // h→c  your id, shared flags byte
 	World,       // h→c  gzipped save bytes
 	Ready,       // c→h  world loaded
 	PlayerJoin,  // h→*  id, name
@@ -48,6 +48,7 @@ public enum Op : byte
 	Chat,           // c→h  text string; h→* senderId byte, senderName string, text string (host-stamped, sender included)
 	Craft,          // RanchSync (refinery fabricate: c→h gadgetId int, host spends; h→c gadgetId int, ok bool; client crafts on ok)
 	Rename,         // c→h  name string; h→* id byte, name string (host-stamped, cleaned)
+	Private,        // Profiles (c→h gzipped PlayerV14 + PediaV03: this player's unshared state)
 }
 
 public static class Packets

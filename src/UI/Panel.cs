@@ -3,6 +3,7 @@ using System.Linq;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using BepInEx.Configuration;
 using TailRanch.Net;
 using TailRanch.Sync;
 using UnityEngine;
@@ -17,7 +18,8 @@ namespace TailRanch.UI;
 //
 // Composition (EclipseOS docs/COMPOSITION.md), one hero per state, one gold per state:
 //   live    header text → link meter (big round-trip + 24-sample history; GOLD = current reading and its bar)
-//           → address capsule (host) → roster well (hairline rows) → bare footer link
+//           → address capsule (host) → roster well (hairline rows) → bare footer links
+//   manage  header text → SHARED well (switches; GOLD = on) → ACCESS well (password) → BANNED well → footer links
 //   joining header text → stepper (current step named large; GOLD = current step) → bare footer link
 //   menu    header text → one well (name row, host row + inline Join; GOLD = Join) → recent-host chips
 //   world   header text → one well (name row) → "Host this world" capsule (GOLD)
@@ -65,7 +67,7 @@ public class Panel : MonoBehaviour
 
 	internal static class R // radius
 	{
-		public const float Panel = 16, Well = 10, Pill = 15, Inline = 13, Card = 20, Chip = 11, Focus = 7; // Inline: half of S.FieldH, so its 9-slice borders never overlap
+		public const float Switch = 8, Panel = 16, Well = 10, Pill = 15, Inline = 13, Card = 20, Chip = 11, Focus = 7; // Inline: half of S.FieldH, so its 9-slice borders never overlap
 	}
 
 	internal static class S // space, px at the 800-line reference height
@@ -76,6 +78,7 @@ public class Panel : MonoBehaviour
 		public const float ChipGap = 6, ChipPadX = 10, InlineGap = 6, DotSize = 6, PingDot = 5;
 		public const float MeterH = 52, Bars = 24, BarW = 3, BarGap = 2, BarMaxH = 26, BarMinH = 2, BarFloorMs = 8, BarHeadroom = 1.25f;
 		public const float StepH = 52, StepBar = 3, StepGap = 4;
+		public const float SwitchW = 30, SwitchH = 16, Knob = 10;
 		public const float CardH = 40, CardGap = 8, CardMinW = 220, CardMaxW = 460, CardPadX = 16, CardGlyph = 6, CardGlyphGap = 12, CardTagGap = 18;
 		public const float Shadow = 26, ShadowDrop = 8, CardShadow = 20, CardDrop = 5, Slide = 14, DockSlide = 18;
 		public const int Tex = 64, TexSmall = 32, ShadowTex = 96;
@@ -120,19 +123,20 @@ public class Panel : MonoBehaviour
 	readonly Dictionary<byte, string> known = new();
 	readonly int[] hist = new int[(int)S.Bars];
 	int histHead, histCount;
-	bool wasActive, wasRemote, hinted, warned;
+	bool wasActive, wasRemote, hinted, warned, managing;
 	string lastStatus = "offline";
 	float quietUntil, vis, height = 160, shownH = 160, nextFind, nextSample, upSince;
 	MainMenuUI mainMenu;
 	string target, address, copyText;
 	List<string> recent;
 	GUIStyle box, well, cardBg, shadow, cardShadow, title, sub, chipTop, chipBottom, big, unit, caption, stepName, micro, label, cardText, cardTag;
-	GUIStyle primary, inline, capsule, copy, quiet, field, chip, kick, placeholder, ping, tag;
+	GUIStyle primary, inline, capsule, copy, quiet, link, field, chip, kick, ban, placeholder, ping, tag, switchOn, switchOff;
 	Texture2D white, dotTex;
 
 	void Start()
 	{
 		target = Plugin.JoinTarget.Value;
+		managing = Plugin.DevManage;
 		recent = PlayerPrefs.GetString(RecentKey, "").Split('\n').Where(s => s.Length > 0).ToList();
 		SceneManager.activeSceneChanged += (_, s) =>
 		{
@@ -385,6 +389,12 @@ public class Panel : MonoBehaviour
 
 	void Live(float e)
 	{
+		if (!Session.IsHost) managing = false;
+		if (managing)
+		{
+			Manage();
+			return;
+		}
 		Meter(e);
 		GUILayout.Space(S.Block);
 		if (Session.IsHost)
@@ -407,7 +417,84 @@ public class Panel : MonoBehaviour
 			Row(p.Name, p.Id == Session.HostId ? "host" : "", ms, Session.IsHost ? p : null);
 		}
 		GUILayout.EndVertical();
-		Footer("Disconnect");
+		Footer("Disconnect", Session.IsHost ? "Manage" : null);
+	}
+
+	static readonly (string name, ConfigEntry<bool> on)[] Shares =
+	{
+		("Money & keys", Plugin.ShareMoney),
+		("Upgrades", Plugin.ShareUpgrades),
+		("Blueprints & gadgets", Plugin.ShareBlueprints),
+		("Pedia, map & mail", Plugin.ShareProgress),
+	};
+
+	// Host management: what's shared (fixed once someone is in, so nobody's state has to split or merge live),
+	// the join password, and this session's bans.
+	void Manage()
+	{
+		var locked = Session.Players.Count > 0;
+		Section("SHARED");
+		GUILayout.BeginVertical(well);
+		for (var i = 0; i < Shares.Length; i++)
+		{
+			if (i > 0) Hairline();
+			GUILayout.BeginHorizontal(GUILayout.Height(S.RowH));
+			GUILayout.Label(Shares[i].name, label);
+			GUILayout.FlexibleSpace();
+			Switch(Shares[i].on, !locked);
+			GUILayout.EndHorizontal();
+		}
+		GUILayout.EndVertical();
+		GUILayout.Label(locked ? "Set before friends join." : "Off: each player keeps their own, saved by you per player.", sub);
+
+		Section("ACCESS");
+		GUILayout.BeginVertical(well);
+		GUILayout.BeginHorizontal();
+		GUILayout.Label("Pass", label, GUILayout.Width(S.Label));
+		Plugin.Password.Value = GUILayout.PasswordField(Plugin.Password.Value, '•', 32, field);
+		if (Plugin.Password.Value.Length == 0 && Repaint) GUI.Label(GUILayoutUtility.GetLastRect(), "none: anyone on the tailnet", placeholder);
+		GUILayout.EndHorizontal();
+		GUILayout.EndVertical();
+
+		if (Session.Bans.Count > 0)
+		{
+			Section("BANNED");
+			GUILayout.BeginVertical(well);
+			foreach (var b in Session.Bans.ToList())
+			{
+				if (b != Session.Bans[0]) Hairline();
+				GUILayout.BeginHorizontal(GUILayout.Height(S.RowH));
+				GUILayout.Label(b.Name, label);
+				GUILayout.FlexibleSpace();
+				if (GUILayout.Button("×", kick, GUILayout.Width(S.RowH - 6))) Session.Bans.Remove(b);
+				GUILayout.EndHorizontal();
+			}
+			GUILayout.EndVertical();
+		}
+		Footer("Disconnect", "Back");
+	}
+
+	void Section(string name)
+	{
+		GUILayout.Space(S.Block * 0.5f);
+		micro.normal.textColor = C.Text3;
+		GUILayout.Label(name, micro);
+		GUILayout.Space(S.ChipGap);
+	}
+
+	void Switch(ConfigEntry<bool> on, bool enabled)
+	{
+		var r = GUILayoutUtility.GetRect(S.SwitchW, S.RowH, GUILayout.Width(S.SwitchW));
+		var track = new Rect(r.x, r.center.y - S.SwitchH * 0.5f, S.SwitchW, S.SwitchH);
+		if (enabled && GUI.Button(track, GUIContent.none, GUIStyle.none)) on.Value = !on.Value;
+		if (!Repaint) return;
+		var keep = GUI.color;
+		if (!enabled) GUI.color = keep * W(0.45f);
+		(on.Value ? switchOn : switchOff).Draw(track, false, false, false, false);
+		var inset = (S.SwitchH - S.Knob) * 0.5f;
+		GUI.color = GUI.color * (on.Value ? C.Accent : C.Text2);
+		GUI.DrawTexture(new Rect(on.Value ? track.xMax - inset - S.Knob : track.x + inset, track.y + inset, S.Knob, S.Knob), dotTex);
+		GUI.color = keep;
 	}
 
 	// The hero: one big round-trip reading (the pane's only gold) beside its last 12 s as a bar history.
@@ -485,10 +572,14 @@ public class Panel : MonoBehaviour
 		Footer("Cancel");
 	}
 
-	void Footer(string what)
+	void Footer(string what, string toggle = null)
 	{
 		GUILayout.Space(S.Block * 0.5f);
+		GUILayout.BeginHorizontal();
 		if (GUILayout.Button(what, quiet)) Session.Stop("offline");
+		GUILayout.FlexibleSpace();
+		if (toggle != null && GUILayout.Button(toggle, link)) managing = !managing;
+		GUILayout.EndHorizontal();
 	}
 
 	void Offline()
@@ -518,6 +609,12 @@ public class Panel : MonoBehaviour
 			GUILayout.Space(S.InlineGap);
 			if (GUILayout.Button("Join", inline, GUILayout.Width(inline.CalcSize(new GUIContent("Join")).x)) && target.Trim().Length > 0)
 				Session.Join(target.Trim());
+			GUILayout.EndHorizontal();
+			Hairline();
+			GUILayout.BeginHorizontal();
+			GUILayout.Label("Pass", label, GUILayout.Width(S.Label));
+			Plugin.JoinPassword.Value = GUILayout.PasswordField(Plugin.JoinPassword.Value, '•', 32, field);
+			if (Plugin.JoinPassword.Value.Length == 0 && Repaint) GUI.Label(GUILayoutUtility.GetLastRect(), "if the host set one", placeholder);
 			GUILayout.EndHorizontal();
 		}
 		GUILayout.EndVertical();
@@ -620,7 +717,11 @@ public class Panel : MonoBehaviour
 			GUILayout.Label($"{ms} ms", ping);
 		}
 		if (tagText.Length > 0) GUILayout.Label(tagText, tag);
-		if (kickable != null && GUILayout.Button("×", kick, GUILayout.Width(S.RowH - 6))) kickable.Peer?.Disconnect();
+		if (kickable != null)
+		{
+			if (GUILayout.Button("ban", ban, GUILayout.Width(ban.CalcSize(new GUIContent("ban")).x))) Session.Kick(kickable, true);
+			if (GUILayout.Button("×", kick, GUILayout.Width(S.RowH - 6))) Session.Kick(kickable, false);
+		}
 		GUILayout.EndHorizontal();
 	}
 
@@ -695,6 +796,8 @@ public class Panel : MonoBehaviour
 		var goldHoverTex = Rounded(S.TexSmall, R.Pill, C.AccentFillHover, C.AccentBorderHover, C.Highlight, 10);
 		var inlineTex = Rounded(S.TexSmall, R.Inline, C.AccentFill, C.AccentBorder, C.Highlight, 8);
 		var inlineHoverTex = Rounded(S.TexSmall, R.Inline, C.AccentFillHover, C.AccentBorderHover, C.Highlight, 8);
+		var switchOnTex = Rounded(S.TexSmall, R.Switch, C.AccentFill, C.AccentBorder, none, 0);
+		var switchOffTex = Rounded(S.TexSmall, R.Switch, C.Lift, C.LiftRim, none, 0);
 		var focusTex = Rounded(S.TexSmall, R.Focus, C.FieldFocus, C.LiftRim, none, 0);
 		var hoverTex = Rounded(S.TexSmall, R.Focus, C.FieldFocus, none, none, 0);
 
@@ -757,6 +860,10 @@ public class Panel : MonoBehaviour
 			active = { textColor = C.Text },
 			alignment = TextAnchor.MiddleLeft, fontSize = Z.Body, fixedHeight = S.RowH,
 		};
+		link = new GUIStyle(quiet) { alignment = TextAnchor.MiddleRight };
+		link.hover.textColor = C.AccentText;
+		switchOn = new GUIStyle { normal = { background = switchOnTex }, border = Pad((int)R.Switch, (int)R.Switch) };
+		switchOff = new GUIStyle { normal = { background = switchOffTex }, border = Pad((int)R.Switch, (int)R.Switch) };
 		field = new GUIStyle
 		{
 			normal = { textColor = C.Text },
@@ -772,6 +879,7 @@ public class Panel : MonoBehaviour
 			border = Pad((int)R.Focus, (int)R.Focus), alignment = TextAnchor.MiddleCenter, fontSize = Z.Kick,
 			fixedHeight = S.RowH - 6, margin = new RectOffset(0, 0, 3, 3),
 		};
+		ban = new GUIStyle(kick) { fontSize = Z.Small, padding = Pad(6, 0) };
 	}
 
 	internal static Texture2D New(int w, int h) => new(w, h, TextureFormat.RGBA32, false)

@@ -159,8 +159,11 @@ public static class EconomySync
 		Session.PlayerReady += p =>
 		{
 			if (!Session.InWorld) return;
-			Session.SendTo(p, Packets.Begin(Op.Money).Also(w => w.Put(Wallet.currency)), RO);
-			Session.SendTo(p, Packets.Begin(Op.Keys).Also(w => w.Put(Wallet.keys)), RO);
+			if (Share.Money)
+			{
+				Session.SendTo(p, Packets.Begin(Op.Money).Also(w => w.Put(Wallet.currency)), RO);
+				Session.SendTo(p, Packets.Begin(Op.Keys).Also(w => w.Put(Wallet.keys)), RO);
+			}
 			Session.SendTo(p, MarketPacket(), RO);
 			Session.SendTo(p, ExchangePacket(), RO);
 		};
@@ -183,7 +186,7 @@ public static class EconomySync
 	// total, plus whatever this frame earned/spent that Flush hasn't sent yet.
 	static void OnTotal(int v, ref bool dirty, int unsent, Func<PlayerModel, int> get, Action<PlayerModel, int> set)
 	{
-		if (!Session.InWorld) return;
+		if (!Session.InWorld || !Share.Money) return;
 		var m = Wallet;
 		using (Session.Apply())
 		{
@@ -198,7 +201,7 @@ public static class EconomySync
 
 	static void Changed(ref int delta, ref bool dirty, int adjust)
 	{
-		if (!Live) return;
+		if (!Live || !Share.Money) return; // unshared: each wallet stays local (Profiles keeps clients')
 		if (Session.IsHost) dirty = true;
 		else delta += adjust;
 	}
