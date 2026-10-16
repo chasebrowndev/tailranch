@@ -31,6 +31,7 @@ public static class RanchSync
 	const float AckTimeout = 2f; // client stops waiting for a SiloOp answer (host lost the silo)
 
 	static readonly AccessTools.FieldRef<LandPlotModel, GameObject> plotObj = AccessTools.FieldRefAccess<LandPlotModel, GameObject>("gameObj");
+	static readonly AccessTools.FieldRef<GardenCatcher, Dictionary<Identifiable.Id, GameObject>> plantables = AccessTools.FieldRefAccess<GardenCatcher, Dictionary<Identifiable.Id, GameObject>>("plantableDict");
 	static readonly AccessTools.FieldRef<Ammo, AmmoModel> ammoModel = AccessTools.FieldRefAccess<Ammo, AmmoModel>("ammoModel");
 	static readonly AccessTools.FieldRef<FillableAshSource, LandPlotModel> ashModel = AccessTools.FieldRefAccess<FillableAshSource, LandPlotModel>("plotModel");
 	static readonly MethodInfo updateAsh = AccessTools.Method(typeof(FillableAshSource), "UpdateAshPosition");
@@ -86,8 +87,12 @@ public static class RanchSync
 			{
 				if (plot.HasAttached()) plot.DestroyAttached();
 			}
-			else if (!plot.HasAttached())
-				plot.GetComponentInChildren<GardenCatcher>(true)?.Plant(crop, isReplacement: false);
+			else if (!plot.HasAttached() && plot.GetComponentInChildren<GardenCatcher>(true) is { } catcher)
+			{
+				// A garden that has never been active (far from this player) hasn't run Awake, so its crop table is empty.
+				if (plantables(catcher).Count == 0) catcher.Awake();
+				catcher.Plant(crop, isReplacement: false);
+			}
 		});
 
 		// h→c  storageId string (plotId, or siteId for warp depots), storageType int, then

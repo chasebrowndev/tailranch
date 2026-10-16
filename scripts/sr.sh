@@ -40,7 +40,7 @@ launch() { # name dir env...
 		env STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM" \
 			STEAM_COMPAT_DATA_PATH="$STATE/pfx-$name" \
 			WINEDLLOVERRIDES="winhttp=n,b" \
-			TAILRANCH_LOOPBACK=1 TAILRANCH_STATS=1 "$@" \
+			TAILRANCH_LOOPBACK=1 TAILRANCH_STATS=1 TAILRANCH_SELFTEST="${SELFTEST:-}" TAILRANCH_NUDGE="${NUDGE:-}" TAILRANCH_PROBE="${PROBE:-}" TAILRANCH_LAG="${LAG:-}" "$@" \
 			"$PROTON" run "$dir/SlimeRancher.exe" -screen-fullscreen 0 -screen-width "${W:-1280}" -screen-height "${H:-720}" \
 			>"$STATE/proton-$name.log" 2>&1 &
 	)

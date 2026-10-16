@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using BepInEx;
 using HarmonyLib;
@@ -32,13 +34,13 @@ public static class Share
 
 // Unshared state lives on the host, per save and per player id (names change, ids don't):
 // BepInEx/config/TailRanch/profiles/<save>/<uid>.dat = the client's PlayerV14 then PediaV03, in the game's
-// own persist format. The client uploads them (Op.Private, gzipped) every minute and whenever it pauses,
+// own persist format. The client uploads them (Op.Private, gzipped) every 15 s (the vac goes stale fast) and whenever it pauses,
 // even while everything is shared, so unsharing later forks from current values, not a stale file.
-// On join the host overlays the unshared fields onto that player's world snapshot. No file yet = the
-// joiner forks from the host's state.
+// On join the host overlays the vac, position and unshared fields onto that player's world snapshot.
+// No file yet = an empty vac and the rest forked from the host's state.
 public static class Profiles
 {
-	const float Interval = 60f;
+	const float Interval = 15f;
 	static float next;
 
 	static readonly MethodInfo pullPlayer = AccessTools.Method(typeof(SavedGame), "Pull", new[] { typeof(GameModel), typeof(PlayerV14) });
@@ -84,23 +86,36 @@ public static class Profiles
 
 	// Host, on join: the snapshot with this player's unshared fields. A shallow copy, so the host's own
 	// SavedGame state (and any other joiner's pending snapshot) is never touched.
+	// The vac, health/energy and where they stood are always per player; a first joiner starts with an empty vac.
 	public static GameV12 Apply(GameV12 state, string uid)
 	{
 		var flags = Share.Flags;
-		if (flags == Shared.All) return state;
-		var path = PathOf(uid);
-		if (!File.Exists(path)) return state;
-		PlayerV14 mine;
-		PediaV03 minePedia;
-		try { (mine, minePedia) = Read(File.ReadAllBytes(path)); }
-		catch (Exception e)
-		{
-			Plugin.Log.LogError($"profile {path}: {e.Message}");
-			return state;
-		}
-		Plugin.Log.LogInfo($"joiner gets their own {~flags & Shared.All} from {path}");
 		var s = (GameV12)clone.Invoke(state, null);
 		var p = s.player = (PlayerV14)clone.Invoke(state.player, null);
+		var path = PathOf(uid);
+		PlayerV14 mine = null;
+		PediaV03 minePedia = null;
+		if (File.Exists(path))
+		{
+			try { (mine, minePedia) = Read(File.ReadAllBytes(path)); }
+			catch (Exception e) { Plugin.Log.LogError($"profile {path}: {e.Message}"); }
+		}
+		if (mine == null)
+		{
+			p.ammo = new Dictionary<PlayerState.AmmoMode, List<AmmoDataV02>>();
+			foreach (var kv in state.player.ammo)
+				p.ammo[kv.Key] = kv.Value.Select(_ => new AmmoDataV02 { id = Identifiable.Id.NONE, count = 0, emotionData = new SlimeEmotionDataV02() }).ToList();
+			Plugin.Log.LogInfo($"joiner {uid} has no profile yet: empty vac, rest from host");
+			return s;
+		}
+		p.ammo = mine.ammo;
+		p.health = mine.health;
+		p.energy = mine.energy;
+		p.radiation = mine.radiation;
+		p.playerPos = mine.playerPos;
+		p.playerRotEuler = mine.playerRotEuler;
+		p.regionSetId = mine.regionSetId;
+		Plugin.Log.LogInfo($"joiner gets their own vac/position{(flags == Shared.All ? "" : $" and {~flags & Shared.All}")} from {path}");
 		if ((flags & Shared.Money) == 0)
 		{
 			p.currency = mine.currency;

@@ -15,7 +15,7 @@ namespace TailRanch;
 public class Plugin : BaseUnityPlugin
 {
 	public const string Guid = "dev.chasebrown.tailranch";
-	public const string Version = "0.4.0";
+	public const string Version = "0.4.3";
 	static int failedHooks;
 	// The menu's version label (Application.version says 1.4.3 on 1.4.4). Needs GameContext, so only valid from the menu on.
 	public static string GameBuild => SRSingleton<GameContext>.Instance ? SRSingleton<GameContext>.Instance.MessageDirector.Get("build", "m.version") : "?";
@@ -51,6 +51,14 @@ public class Plugin : BaseUnityPlugin
 	public static readonly bool DevChatDemo = System.Environment.GetEnvironmentVariable("TAILRANCH_CHATDEMO") == "1";
 	// The host's panel opens on its manage view.
 	public static readonly bool DevManage = System.Environment.GetEnvironmentVariable("TAILRANCH_MANAGE") == "1";
+	// The host steps 4 m ahead and turns around once a peer joins, so the peer sees its avatar head-on.
+	public static readonly bool DevNudge = System.Environment.GetEnvironmentVariable("TAILRANCH_NUDGE") == "1";
+	// Scripted purchases/sales on both sides with state digests to diff (Dev/SelfTest).
+	public static readonly bool DevSelfTest = System.Environment.GetEnvironmentVariable("TAILRANCH_SELFTEST") == "1";
+	// Scripted vac/death/hen/garden/walk checks with logs and screenshots (Dev/Probe).
+	public static readonly (int min, int max) DevLag = System.Environment.GetEnvironmentVariable("TAILRANCH_LAG") is { Length: > 0 } lag
+		&& lag.Split(',') is { Length: 2 } mm && int.TryParse(mm[0], out var lo) && int.TryParse(mm[1], out var hi) ? (lo, hi) : (0, 0);
+	public static readonly bool DevProbe = System.Environment.GetEnvironmentVariable("TAILRANCH_PROBE") == "1";
 
 	public static string Name => DevName.Length > 0 ? DevName : PlayerName.Value.Trim().Length > 0 ? PlayerName.Value.Trim() : System.Environment.MachineName;
 
@@ -109,6 +117,8 @@ public class Plugin : BaseUnityPlugin
 		("PresenceSync", PresenceSync.Tick),
 		("ProfileSync", ProfileSync.Tick),
 		("Profiles", Profiles.Tick),
+		("SelfTest", SelfTest.Tick),
+		("Probe", Probe.Tick),
 	};
 	static readonly string[] lastError = new string[ticks.Length];
 

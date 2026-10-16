@@ -1,5 +1,7 @@
 using System.Collections.Generic;
+using HarmonyLib;
 using LiteNetLib;
+using LiteNetLib.Utils;
 using MonomiPark.SlimeRancher.Regions;
 using TailRanch.Net;
 using UnityEngine;
@@ -36,12 +38,13 @@ public static class PlayerSync
 			var pos = r.GetVector3();
 			var yaw = r.GetFloat();
 			var pitch = r.GetFloat();
+			var vac = ReadVac(r);
 			// Avatar missing (joined before our world was up) or lost to a scene load: (re)create on demand.
 			if ((!avatars.TryGetValue(id, out var a) || !a) && id != Session.LocalId && Session.InWorld && Session.Players.TryGetValue(id, out var p))
 				avatars[id] = a = RemoteAvatar.Create(p);
 			if (!a) return;
 			heard[id] = pos;
-			a.Push(pos, yaw, pitch);
+			a.Push(pos, yaw, pitch, vac);
 		});
 	}
 
@@ -60,7 +63,66 @@ public static class PlayerSync
 		w.Put(player.position);
 		w.Put(player.eulerAngles.y);
 		w.Put(cam ? cam.transform.eulerAngles.x : 0f);
+		WriteVac(w, player);
 		Session.Distribute(w, DeliveryMethod.Sequenced);
+	}
+
+	// The local vac as others see it: cone on, the spiral/dial values VacColorAnimator drives, and shots and
+	// captures as running counters (a dropped packet just plays them one update late).
+	static WeaponVacuum vac;
+	static VacColorAnimator vacColors;
+	static byte shots, captures;
+	static readonly AccessTools.FieldRef<WeaponVacuum, GameObject> vacFX = AccessTools.FieldRefAccess<WeaponVacuum, GameObject>("vacFX");
+	static readonly AccessTools.FieldRef<WeaponVacuum, GameObject> held = AccessTools.FieldRefAccess<WeaponVacuum, GameObject>("held");
+	static readonly AccessTools.FieldRef<VacColorAnimator, Material> dialMat = AccessTools.FieldRefAccess<VacColorAnimator, Material>("vacDialMat");
+	static readonly AccessTools.FieldRef<VacColorAnimator, float> colorVal = AccessTools.FieldRefAccess<VacColorAnimator, float>("colorVal");
+
+	static void WriteVac(NetDataWriter w, Transform player)
+	{
+		if (!vac)
+		{
+			vac = player.GetComponentInChildren<WeaponVacuum>(true);
+			vacColors = vac ? vac.GetComponentInChildren<VacColorAnimator>(true) : null;
+		}
+		var flags = (byte)((vac && vacFX(vac) && vacFX(vac).activeSelf ? 1 : 0) | (vac && held(vac) ? 2 : 0));
+		var dial = vacColors ? dialMat(vacColors) : null;
+		w.Put(flags);
+		w.Put((byte)Mathf.RoundToInt(Mathf.Clamp01(vacColors ? colorVal(vacColors) : 0.5f) * 255f));
+		w.Put((byte)Mathf.RoundToInt(Mathf.Clamp01(dial ? dial.GetFloat(RemoteAvatar.AmmoFullnessId) : 0f) * 255f));
+		Color32 c = dial ? dial.GetColor(RemoteAvatar.AmmoColorId) : Color.black;
+		w.Put(c.r); w.Put(c.g); w.Put(c.b); w.Put(c.a);
+		w.Put(shots);
+		w.Put(captures);
+		if ((flags & 2) != 0) w.Put(ActorSync.IdOf(held(vac)));
+	}
+
+	static RemoteAvatar.VacView ReadVac(NetDataReader r)
+	{
+		var flags = r.GetByte();
+		var v = new RemoteAvatar.VacView
+		{
+			cone = (flags & 1) != 0,
+			holding = (flags & 2) != 0,
+			spiral = r.GetByte() / 255f,
+			fullness = r.GetByte() / 255f,
+			ammo = new Color32(r.GetByte(), r.GetByte(), r.GetByte(), r.GetByte()),
+			shots = r.GetByte(),
+			captures = r.GetByte(),
+		};
+		if (v.holding) v.heldId = r.GetLong();
+		return v;
+	}
+
+	[HarmonyPatch(typeof(WeaponVacuum), "ShootEffect")]
+	static class CountShots
+	{
+		static void Postfix() => shots++;
+	}
+
+	[HarmonyPatch(typeof(WeaponVacuum), "CaptureEffect")]
+	static class CountCaptures
+	{
+		static void Postfix() => captures++;
 	}
 
 	// Only replaces the avatar: a re-announced player keeps the actors it simulates.

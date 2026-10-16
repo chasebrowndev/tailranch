@@ -239,6 +239,10 @@ public static class Session
 		AutoRecycle = true,
 		DisconnectTimeout = 15000,
 		IPv6Enabled = true,
+		// Dev: TAILRANCH_LAG=min,max ms of simulated one-way latency (jitter) on every packet.
+		SimulateLatency = Plugin.DevLag.max > 0,
+		SimulationMinLatency = Plugin.DevLag.min,
+		SimulationMaxLatency = Plugin.DevLag.max,
 	};
 
 	static EventBasedNetListener Listener()

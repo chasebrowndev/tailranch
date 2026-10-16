@@ -38,6 +38,23 @@ public static class DevAuto
 		if (Plugin.DevAutoJoin.Length > 0) AutoJoin(menuReady);
 		if (Plugin.DevStats && Time.unscaledTime >= nextStats) FlushStats();
 		if (Plugin.DevPause) AutoPause();
+		if (Plugin.DevNudge) Nudge();
+	}
+
+	static float nudgeAt = -1f;
+	static bool nudged;
+
+	static void Nudge()
+	{
+		if (nudged || !Session.IsHost || !Session.InWorld || Session.Players.Count == 0) return;
+		if (nudgeAt < 0f) nudgeAt = Time.unscaledTime + 3f;
+		if (Time.unscaledTime < nudgeAt) return;
+		nudged = true;
+		var p = SRSingleton<SceneContext>.Instance.Player;
+		var fwd = Vector3.ProjectOnPlane(p.transform.forward, Vector3.up).normalized;
+		p.GetComponent<TeleportablePlayer>().TeleportTo(p.transform.position + fwd * 4f, MonomiPark.SlimeRancher.Regions.RegionRegistry.RegionSetId.HOME,
+			new Vector3(0, p.transform.eulerAngles.y + 180f, 0), false, false);
+		Plugin.Log.LogInfo("dev: nudged host 4 m ahead, facing back");
 	}
 
 	// Opens the pause menu once a session has a peer, so the docked panel can be screenshotted.

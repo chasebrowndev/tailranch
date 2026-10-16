@@ -62,6 +62,8 @@ public static class ActorSync
 	// Consumers (eat, market, silo, incinerator, collectors) must ignore such actors.
 	public static bool IsRemoteOwned(long actorId) => Session.Active && !Owns(actorId);
 	public static bool IsRemoteOwned(GameObject go) => go && idOf.TryGetValue(go, out var id) && IsRemoteOwned(id);
+	public static long IdOf(GameObject go) => go && idOf.TryGetValue(go, out var id) ? id : 0;
+	public static GameObject Find(long id) => objs.TryGetValue(id, out var go) && go ? go : null;
 
 	static bool Owns(long id) => Session.IsClient ? owner.TryGetValue(id, out var o) && o == Session.LocalId : !owner.ContainsKey(id);
 
@@ -894,7 +896,8 @@ public static class ActorSync
 		static IEnumerable<MethodBase> TargetMethods() => Named(typeof(WeaponVacuum), "Expel")
 			.Concat(Named(typeof(WeaponVacuum), "ConsumeVacItem"))
 			.Concat(Named(typeof(ToyShopUI), "InstantiateToy"))
-			.Concat(Named(typeof(SiloCatcher), "OnTriggerStay"));
+			.Concat(Named(typeof(SiloCatcher), "OnTriggerStay"))
+			.Concat(Named(typeof(RescueAmmoOnDeath), "SpawnRescuedItems")); // only ever the local player's own death
 
 		static void Prefix() => scope++;
 		static void Finalizer() => scope--;
@@ -938,7 +941,7 @@ public static class ActorSync
 			(typeof(EchoNet), "SpawnAt"), (typeof(GingerPatchNode), "Grow"), (typeof(KookadobaPatchNode), "Grow"),
 			(typeof(ExchangeEjector), "Eject"), (typeof(DirectRewardEjector), "Eject"), (typeof(FireColumn), "SpawnFireball"),
 			(typeof(FashionPod), "Update"), (typeof(GoldSlimeProducePlorts), "ProduceAt"), (typeof(ReactToShock), "MaybeCreatePlorts"),
-			(typeof(RescueAmmoOnDeath), "SpawnRescuedItems"), (typeof(TransformChanceOnReproduce), "MaybeTransform"),
+			(typeof(TransformChanceOnReproduce), "MaybeTransform"),
 			(typeof(GlitchTarrSterilizeOnWater), "WillDestroyAfterTime"), (typeof(LemonPhasor), "OnTriggerEnter"),
 			(typeof(DirectedCrateSpawner), "Spawn"), (typeof(DirectedAuxItemSpawner), "Spawn"), (typeof(PollenCloudController), "Update"),
 		}.SelectMany(x => Named(x.Item1, x.Item2))

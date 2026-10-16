@@ -18,10 +18,14 @@
     <Reference Include="$(Managed)/Assembly-CSharp.dll" Private="false" />
     <Reference Include="$(Managed)/UnityEngine.dll" Private="false" />
     <Reference Include="$(Managed)/UnityEngine.CoreModule.dll" Private="false" />
+    <Reference Include="$(Managed)/UnityEngine.AnimationModule.dll" Private="false" />
+    <Reference Include="$(Managed)/UnityEngine.AudioModule.dll" Private="false" />
     <Reference Include="$(Managed)/UnityEngine.IMGUIModule.dll" Private="false" />
     <Reference Include="$(Managed)/UnityEngine.InputLegacyModule.dll" Private="false" />
     <Reference Include="$(Managed)/UnityEngine.PhysicsModule.dll" Private="false" />
+    <Reference Include="$(Managed)/UnityEngine.ParticleSystemModule.dll" Private="false" />
     <Reference Include="$(Managed)/UnityEngine.TextRenderingModule.dll" Private="false" />
+    <Reference Include="$(Managed)/UnityEngine.ScreenCaptureModule.dll" Private="false" />
   </ItemGroup>
 
   <Target Name="Deploy" AfterTargets="Build" Condition="'$(NoDeploy)' != 'true'">
